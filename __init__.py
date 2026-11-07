@@ -1,0 +1,1 @@
+"""AstrBot magnet delivery plugin."""

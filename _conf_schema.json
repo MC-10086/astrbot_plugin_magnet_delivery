@@ -1,0 +1,82 @@
+{
+  "download_backend": {
+    "type": "string", "description": "下载器", "hint": "插件不自带下载器。请自行下载并安装要使用的下载器，再在此选择并配置。所有群的新任务使用同一个下载器，保存后重载插件。",
+    "options": ["none", "xunlei_cli", "qb", "aria2_auto", "aria2", "advanced"],
+    "labels": ["未选择", "迅雷官方 CLI", "qBittorrent", "aria2（自动管理）", "aria2（手动连接）", "高级 JSON"],
+    "default": "none"
+  },
+  "qb": {
+    "type": "object", "description": "qBittorrent（本机）", "condition": {"download_backend": "qb"}, "hint": "填写 qBittorrent Web UI 的账号密码。默认端口 8080，远程服务器或 HTTPS 请使用高级 JSON 配置。", "items": {
+      "enabled": {"type": "bool", "invisible": true, "default": false},
+      "port": {"type": "int", "description": "Web UI端口", "default": 8080},
+      "username": {"type": "string", "description": "用户名", "default": "admin"},
+      "password": {"type": "string", "description": "密码", "secret": true, "default": ""},
+      "download_dir": {"type": "string", "description": "独立下载目录（选填）", "hint": "通常留空，跟随统一下载目录；需要qB单独存放时再填写。", "default": ""}
+    }
+  },
+  "aria2_auto": {
+    "type": "object", "description": "aria2 自动管理", "condition": {"download_backend": "aria2_auto"}, "hint": "插件自动在后台启动 aria2。填写程序路径即可；端口和密钥由插件管理。", "items": {
+      "enabled": {"type": "bool", "invisible": true, "default": false},
+      "executable": {"type": "string", "description": "aria2c.exe完整路径", "hint": "可在插件详情→目录设置中点击浏览选择程序。也可填写exe路径；已加入PATH时可留空。", "default": ""},
+      "download_dir": {"type": "string", "description": "独立下载目录（选填）", "hint": "通常留空，共用上面的统一目录。只有想为自动aria2分别存放时才填写；目录设置视图支持可选的分别设置。", "default": ""}
+    }
+  },
+  "xunlei_cli": {
+    "type": "object", "description": "迅雷官方 CLI（Windows）", "condition": {"download_backend": "xunlei_cli"}, "hint": "在运行 AstrBot 的 Windows 电脑上安装迅雷并登录账号。提交下载时会检查客户端状态，未启动时自动启动。已将官方 Skill ZIP 导入 AstrBot 时通常可留空程序路径。保存后重载，可在目录设置视图测试连接。", "items": {
+      "enabled": {"type": "bool", "invisible": true, "default": false},
+      "executable": {"type": "string", "description": "xunlei-cli.exe 完整路径（可自动查找）", "hint": "可在插件详情的目录设置视图中浏览选择。", "default": ""},
+      "download_dir": {"type": "string", "description": "独立下载目录（选填）", "default": ""}
+    }
+  },
+  "aria2": {
+    "type": "object", "description": "aria2 手动连接", "condition": {"download_backend": "aria2"}, "hint": "填写你自行运行的 aria2 的 RPC 端口和密钥。", "items": {
+      "enabled": {"type": "bool", "invisible": true, "default": false},
+      "port": {"type": "int", "description": "RPC端口", "default": 6800},
+      "secret": {"type": "string", "description": "RPC密钥（rpc-secret）", "secret": true, "default": ""},
+      "download_dir": {"type": "string", "description": "独立下载目录（选填）", "hint": "通常留空，跟随统一下载目录；需要手动aria2单独存放时再填写。", "default": ""}
+    }
+  },
+  "backends_json": {
+    "type": "text", "description": "高级下载器配置（JSON）", "secret": true, "condition": {"download_backend": "advanced"},
+    "hint": "可保存多个 qBittorrent 或 aria2 连接，通过下方的配置名称指定一个。参见 README。",
+    "default": "[]"
+  },
+  "advanced_name": {"type": "string", "description": "使用的高级配置名称", "condition": {"download_backend": "advanced"}, "hint": "填写 JSON 中的 name。只有一个有效条目时可留空。", "default": ""},
+  "download_paths": {
+    "type": "object", "description": "统一下载目录", "hint": "所有下载器默认共用此目录，无需分别填写。可在目录设置视图中点击浏览；需要单独存放时再展开“为当前下载器设置独立目录”。每个任务仍使用独立子目录。", "items": {
+      "directory": {"type": "string", "description": "下载目录（留空自动创建）", "hint": "默认 data/plugin_data/astrbot_plugin_magnet_delivery/downloads。各下载器的独立目录留空即可跟随这里；高级JSON显式local_root优先。", "default": ""}
+    }
+  },
+  "delivery": {
+    "type": "object", "description": "下载完成后的处理", "hint": "默认自动压缩并发送到原群。各群可单独设置，单次任务也可指定选项；更改仅影响新任务。", "items": {
+      "compress": {"type": "bool", "description": "自动压缩为 ZIP", "hint": "关闭后若自动发送开启，将逐个上传原文件；每个文件须小于上传上限。", "default": true},
+      "encrypt": {"type": "bool", "description": "为压缩包设置密码", "hint": "需要开启自动压缩，并可调用 7-Zip；使用 AES-256 ZIP，不自动将密码发送到群内。", "default": false},
+      "password": {"type": "string", "description": "压缩密码", "secret": true, "hint": "1至99位英文、数字或符号，不含中文或双引号。请自行向接收者提供；待压缩加密任务完成前请勿更改，否则将停止压缩。", "default": ""},
+      "auto_send": {"type": "bool", "description": "完成后自动发送到原群", "hint": "关闭后保存在本机，通过 /magnet send <任务编号> 手动发送。", "default": true},
+      "delete_after_send": {"type": "bool", "description": "自动发送成功后删除本地文件", "condition": {"auto_send": true}, "hint": "默认开启，可在启用自动发送时关闭。全部群文件上传成功且协议端返回file_id后，移除下载器任务并清理下载内容、ZIP及临时文件；失败或结果未知时保留文件。清理失败可在任务页重试，无需重新发送。", "default": true},
+      "archiver": {"type": "string", "description": "压缩方式", "options": ["auto", "builtin", "7zip"], "labels": ["系统 ZIP（默认）", "插件内置 ZIP", "7-Zip"], "hint": "普通压缩默认使用 Windows 自带 ZIP，其他系统使用插件内置 ZIP。启用密码保护时使用 7-Zip。也可手动选择 7-Zip。", "default": "auto"},
+      "executable": {"type": "string", "description": "7-Zip 程序路径（通常留空）", "hint": "仅选择 7-Zip 或使用密码保护时需要。插件会自动查找，找不到时请填写 7z.exe 完整路径。", "default": ""}
+    }
+  },
+  "preview_proxy": {"type": "string", "description": "预览代理：system跟随系统；留空直连；或填写HTTP(S)代理URL", "hint": "仅影响预览API和截图，不改变下载器连接；PAC脚本和SOCKS不在此版本支持范围。修改后重载。", "default": "system", "secret": true},
+  "preview_enabled": {"type": "bool", "description": "启用WhatsLink磁力预览（查询哈希会发送给第三方）", "default": true},
+  "preview_inline_images": {"type": "bool", "description": "发送允许域名的预览截图（始终提供截图链接）", "default": true},
+  "preview_image_hosts": {"type": "list", "description": "允许内联截图的HTTPS域名；点开头表示子域名，其他截图仅返回链接", "default": ["whatslink.info", ".whatslink.info"]},
+  "preview_cooldown": {"type": "int", "description": "每个聊天预览冷却秒", "default": 15},
+  "preview_cache_seconds": {"type": "int", "description": "预览结果缓存秒（重载后清空）", "default": 3600},
+  "default_backend": {"type": "string", "invisible": true, "default": "qb"},
+  "allowed_groups": {"type": "list", "description": "允许的群号（字符串列表，空表示不额外限制；仍需管理员在群内 on）", "default": []},
+  "concurrency": {"type": "int", "description": "全局任务并发（下载到上传全过程）", "default": 2},
+  "max_queue": {"type": "int", "description": "全局进行中任务上限", "default": 50},
+  "max_per_chat": {"type": "int", "description": "每个聊天进行中任务上限", "default": 5},
+  "max_download_mib": {"type": "int", "description": "单任务下载上限 MiB", "default": 8192},
+  "max_upload_mib": {"type": "int", "description": "每个群文件上传上限与压缩分卷大小 MiB", "hint": "默认 3800 MiB，约 3.98 GB。ZIP 超过此值时自动分卷，关闭压缩时按原文件大小检查。", "default": 3800},
+  "max_files": {"type": "int", "description": "单任务文件数上限", "default": 2000},
+  "reserve_mib": {"type": "int", "description": "最低磁盘预留 MiB", "default": 512},
+  "poll_seconds": {"type": "int", "description": "下载轮询间隔秒", "default": 5},
+  "task_timeout": {"type": "int", "description": "从入队起下载总时限秒", "default": 21600},
+  "archive_timeout": {"type": "int", "description": "压缩超时秒", "default": 1800},
+  "upload_timeout": {"type": "int", "description": "群文件上传超时秒（超时后须人工核对）", "default": 1800},
+  "qq_local_prefix": {"type": "string", "description": "QQ文件映射：AstrBot本机目录前缀（同机无需填写）", "default": ""},
+  "qq_remote_prefix": {"type": "string", "description": "QQ文件映射：NapCat可见目录前缀", "default": ""}
+}

@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>下载目录设置</title><link rel="stylesheet" href="./style.css"></head>
+<body><main>
+  <h1>下载目录设置</h1><p class="intro">默认只需选择一个目录，所有下载器共用。每个任务会自动创建独立子目录。</p>
+  <div id="shared-fields"></div>
+  <section class="options" hidden><label><input id="separate" type="checkbox">为当前下载器设置独立目录（可选）</label><p class="intro">关闭后，当前下载器使用统一下载目录。</p></section>
+  <div id="individual-fields" hidden></div><div id="program-fields"></div>
+  <footer><button id="save" class="primary" disabled>保存路径</button><span>保存后请重载插件，新任务才会使用新目录。</span></footer>
+  <p id="status" role="status">正在连接 AstrBot…</p>
+</main>
+<dialog id="picker"><form method="dialog"><header><h2 id="picker-title">选择目录</h2><button aria-label="关闭">×</button></header></form>
+  <div id="drives"></div><div class="location"><button id="up">上一级</button><input id="location" aria-label="当前目录"><button id="go">前往</button><button id="start-location" hidden>返回起始位置</button></div>
+  <p id="browse-status" role="status"></p><div id="entries"></div>
+  <footer id="pagination" hidden><button id="previous-page">上一页</button><span id="page-info"></span><button id="next-page">下一页</button></footer>
+  <footer><button id="choose" class="primary">使用此目录</button><button id="cancel">取消</button></footer>
+</dialog><script type="module" src="./app.js"></script></body></html>
