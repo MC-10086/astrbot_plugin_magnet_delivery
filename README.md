@@ -1,6 +1,6 @@
 # AstrBot 磁力下载与回传
 
-版本 **1.0.0**，适用于 AstrBot `>=4.29.4,<5`。**`/magnet` 指令由插件直接处理，无需 Agent 或 LLM。**
+版本 **1.0.1**，适用于 AstrBot `>=4.29.4,<5`。**`/magnet` 指令由插件直接处理，无需 Agent 或 LLM。**
 
 支持 QQ OneBot v11 群聊中提交磁力、按聊天查看任务、取消、选择后端，下载完成后生成 ZIP 并调用群文件上传接口。实际 QQ 交付以支持 `upload_group_file` 的协议端（例如 NapCat）为前提。
 

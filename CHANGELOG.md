@@ -1,5 +1,9 @@
 # 更新记录
 
+## 1.0.1
+
+- WhatsLink 预览连接失败日志统一使用 AstrBot 提供的 `astrbot.api.logger`，满足插件市场日志规范。
+
 ## 1.0.0
 
 - 补全迅雷官方 CLI 下载、Skill 导入和插件配置步骤。
