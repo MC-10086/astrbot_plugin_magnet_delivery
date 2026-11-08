@@ -6,7 +6,9 @@ from unittest.mock import patch
 import httpx
 
 from astrbot_plugin_magnet_delivery.core.preview import (
+    ENDPOINT,
     PreviewService,
+    _windows_route,
     public_image_url,
     render,
     resolve_proxy,
@@ -24,47 +26,59 @@ PAYLOAD = {
 
 
 class PreviewTests(unittest.IsolatedAsyncioTestCase):
-    def test_system_proxy_explicit_proxy_and_direct(self):
-        with patch(
-            "astrbot_plugin_magnet_delivery.core.preview.getproxies",
-            return_value={"https": "http://127.0.0.1:7890"},
-        ):
-            self.assertEqual(resolve_proxy("system"), "http://127.0.0.1:7890")
-        with (
-            patch("astrbot_plugin_magnet_delivery.core.preview.getproxies", return_value={}),
-            patch("astrbot_plugin_magnet_delivery.core.preview.registry_proxies", return_value={}),
-        ):
-            self.assertIsNone(resolve_proxy("system"))
+    def test_explicit_proxy_and_direct(self):
         self.assertIsNone(resolve_proxy(""))
         self.assertEqual(resolve_proxy("http://127.0.0.1:8888"), "http://127.0.0.1:8888")
         with self.assertRaises(ValueError):
             resolve_proxy("file:///private")
 
-    def test_astrbot_no_proxy_does_not_hide_windows_system_proxy(self):
-        with (
-            patch(
-                "astrbot_plugin_magnet_delivery.core.preview.getproxies",
-                return_value={"no": "localhost,127.0.0.1,::1"},
-            ),
-            patch(
-                "astrbot_plugin_magnet_delivery.core.preview.registry_proxies",
-                return_value={"http": "http://127.0.0.1:7890"},
-            ),
+    def test_windows_route_uses_https_endpoint_and_honors_bypass(self):
+        with patch(
+            "astrbot_plugin_magnet_delivery.core.preview.windows_proxy_rules",
+            return_value=("http=127.0.0.1:8888 https=127.0.0.1:7897", "*.example.test;<local>"),
         ):
-            self.assertEqual(resolve_proxy("system"), "http://127.0.0.1:7890")
+            self.assertEqual(_windows_route(ENDPOINT), "http://127.0.0.1:7897")
+            self.assertEqual(_windows_route("https://cdn.example.test/image/1"), "")
 
-    def test_explicit_environment_proxy_keeps_priority_over_registry(self):
+    async def test_hash_only_placeholder_is_not_a_preview(self):
+        placeholder = {"name": "a" * 40, "file_type": "", "size": 0, "count": 1, "screenshots": None}
+        self.mock(lambda request: httpx.Response(200, json=placeholder))
+        with self.assertRaisesRegex(ValueError, "暂未收录"):
+            await self.service.lookup(MAGNET, "group")
+
+    async def test_system_route_is_resolved_for_each_request_and_never_falls_back(self):
+        service = PreviewService(proxy="system")
+        screenshot = PAYLOAD["screenshots"][0]["screenshot"]
+        routes = []
+
+        def client(proxy):
+            routes.append(proxy)
+
+            def respond(request):
+                if proxy == "http://127.0.0.1:9090":
+                    raise httpx.ConnectError("unreachable", request=request)
+                if str(request.url) == screenshot:
+                    return httpx.Response(
+                        200, headers={"content-type": "image/jpeg"},
+                        content=bytes.fromhex("ffd8ff") + b"test",
+                    )
+                return httpx.Response(200, json=PAYLOAD)
+
+            return httpx.AsyncClient(transport=httpx.MockTransport(respond))
+
         with (
-            patch(
-                "astrbot_plugin_magnet_delivery.core.preview.getproxies",
-                return_value={"https": "http://127.0.0.1:8888", "no": "localhost"},
-            ),
-            patch(
-                "astrbot_plugin_magnet_delivery.core.preview.registry_proxies",
-                return_value={"http": "http://127.0.0.1:7890"},
-            ),
+            patch("astrbot_plugin_magnet_delivery.core.preview.resolve_proxy",
+                  side_effect=["http://127.0.0.1:7897", None, "http://127.0.0.1:9090"]) as resolve,
+            patch.object(service, "_client", side_effect=client),
         ):
-            self.assertEqual(resolve_proxy("system"), "http://127.0.0.1:8888")
+            await service.lookup(MAGNET, "group")
+            self.assertIsNotNone(await service.image(screenshot))
+            self.assertIsNone(await service.image(screenshot))
+        self.assertEqual(
+            [entry.args[1] for entry in resolve.call_args_list], [ENDPOINT, screenshot, screenshot]
+        )
+        self.assertEqual(routes, ["http://127.0.0.1:7897", None, "http://127.0.0.1:9090"])
+        await service.close()
 
     async def asyncSetUp(self):
         self.service = PreviewService()

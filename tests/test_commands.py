@@ -393,6 +393,28 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Example", response)
         self.assertEqual(self.plugin.manager.store.list(), [])
 
+    async def test_preview_continues_after_onebot_rejects_a_screenshot(self):
+        from unittest.mock import AsyncMock, patch
+
+        from aiocqhttp.exceptions import ActionFailed
+
+        urls = [f"https://whatslink.info/image/{i}" for i in range(3)]
+        result = {
+            "hash": "a" * 40, "name": "test", "file_type": "video",
+            "size": 100, "count": 1, "screenshots": urls,
+        }
+        event = self.event("/magnet preview magnet:?xt=urn:btih:" + "a" * 40)
+        event.send = AsyncMock(side_effect=[None, ActionFailed({"retcode": 1200}), None])
+        with (
+            patch.object(self.plugin.preview, "lookup", return_value=result),
+            patch.object(self.plugin.preview, "image", return_value=b"test image") as fetch,
+        ):
+            responses = [item async for item in self.plugin.magnet(event)]
+        self.assertEqual(len(responses), 1)
+        self.assertIn(urls[-1], responses[0])
+        self.assertEqual([item.args[0] for item in fetch.await_args_list], urls)
+        self.assertEqual(event.send.await_count, 3)
+
     async def test_preview_task_id_remains_chat_scoped_and_respects_whitelist(self):
         route = self.plugin.route(self.event(""))
         task = await self.plugin.manager.submit(route, "magnet:?xt=urn:btih:" + "d" * 40, "qb")

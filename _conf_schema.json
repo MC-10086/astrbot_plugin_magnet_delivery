@@ -58,7 +58,7 @@
       "executable": {"type": "string", "description": "7-Zip 程序路径（通常留空）", "hint": "仅选择 7-Zip 或使用密码保护时需要。插件会自动查找，找不到时请填写 7z.exe 完整路径。", "default": ""}
     }
   },
-  "preview_proxy": {"type": "string", "description": "预览代理：system跟随系统；留空直连；或填写HTTP(S)代理URL", "hint": "仅影响预览API和截图，不改变下载器连接；PAC脚本和SOCKS不在此版本支持范围。修改后重载。", "default": "system", "secret": true},
+  "preview_proxy": {"type": "string", "description": "预览代理：system动态跟随系统；留空直连；或填写HTTP(S)代理URL", "hint": "仅用于预览 API 和截图。Windows 下 system 按目标地址读取当前用户代理设置，支持 PAC 和绕过规则。系统设置变动无需重载，修改此字段后需重载。", "default": "system", "secret": true},
   "preview_enabled": {"type": "bool", "description": "启用WhatsLink磁力预览（查询哈希会发送给第三方）", "default": true},
   "preview_inline_images": {"type": "bool", "description": "发送允许域名的预览截图（始终提供截图链接）", "default": true},
   "preview_image_hosts": {"type": "list", "description": "允许内联截图的HTTPS域名；点开头表示子域名，其他截图仅返回链接", "default": ["whatslink.info", ".whatslink.info"]},

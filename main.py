@@ -28,7 +28,7 @@ from .core.managed_aria2 import ManagedAria2
 from .core.manager import Manager, matching_profile
 from .core.models import chat_key
 from .core.path_picker import PathPicker
-from .core.preview import PreviewService, render, resolve_proxy
+from .core.preview import PreviewService, render
 from .core.task_view import listing
 from .core.xunlei_cli import XunleiCLI
 
@@ -252,7 +252,7 @@ class MagnetDelivery(Star):
             self.config.save_config()
         self.manager.start()
         self.preview = PreviewService(
-            proxy=resolve_proxy(self.config.get("preview_proxy", "system")),
+            proxy=self.config.get("preview_proxy", "system"),
             cooldown=max(1, int(self.config.get("preview_cooldown", 15))),
             cache_seconds=max(30, int(self.config.get("preview_cache_seconds", 3600))),
             image_hosts=self.config.get(
@@ -570,14 +570,19 @@ class MagnetDelivery(Star):
                 result = await self.preview.lookup(target, route["chat"])
                 yield event.plain_result(render(result))
                 if self.config.get("preview_inline_images", True):
-                    for url in result["screenshots"]:
+                    for index, url in enumerate(result["screenshots"], 1):
                         data = await self.preview.image(url)
-                        if data:
-                            try:
-                                await event.send(MessageChain([Image.fromBytes(data)]))
-                            except Exception:
-                                # Text and URLs are already delivered; avoid duplicating the card.
-                                break
+                        if not data:
+                            continue
+                        try:
+                            await event.send(MessageChain([Image.fromBytes(data)]))
+                        except Exception as exc:
+                            # Avoid retrying an image with uncertain delivery. Try the next one.
+                            retcode = exc.result.get("retcode") if isinstance(exc, ActionFailed) else None
+                            logger.warning(
+                                "磁力预览第 %d 张截图发送失败（%s，OneBot 返回码 %s）",
+                                index, type(exc).__name__, retcode if type(retcode) is int else "未知",
+                            )
                 return
             elif action == "add":
                 self._allowed(route)
