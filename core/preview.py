@@ -3,7 +3,6 @@
 import asyncio
 import ipaddress
 import json
-import logging
 import time
 import urllib.request
 from collections import OrderedDict
@@ -193,8 +192,10 @@ class PreviewService:
                     f"预览服务返回 HTTP {exc.response.status_code}（{self.connection_mode}）"
                 ) from None
             except httpx.HTTPError as exc:
+                from astrbot.api import logger
+
                 # No exception text: it may expose proxy passwords or query URLs.
-                logging.getLogger(__name__).warning(
+                logger.warning(
                     "WhatsLink connection failed: %s (%s)", type(exc).__name__, self.connection_mode
                 )
                 raise ValueError(
