@@ -5,6 +5,7 @@ const pending = new Set();
 const status = (text, error = false) => { $("#status").textContent = text; $("#status").classList.toggle("error", error); };
 const element = (tag, text, className) => { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; };
 const size = (bytes) => bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(2)} GiB` : `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+const chatLabel = (group) => group.private_user ? `私聊 ${group.private_user}` : `群 ${group.group}`;
 function choices(select, values, fallback) {
   const previous = select.value;
   select.replaceChildren(new Option(fallback, ""), ...values.map(([value, label]) => new Option(label, value)));
@@ -15,7 +16,7 @@ function render() {
   const groups = data.groups;
   choices($("#platform"), [...new Set(groups.map(group => group.platform))].map(value => [value, value]), "全部实例");
   const platform = $("#platform").value;
-  choices($("#group"), groups.filter(group => !platform || group.platform === platform).map(group => [group.chat, `群 ${group.group} · ${group.platform}`]), "全部群聊");
+  choices($("#group"), groups.filter(group => !platform || group.platform === platform).map(group => [group.chat, `${chatLabel(group)} · ${group.platform}`]), "全部会话");
   $("#active").textContent = data.summary.active;
   $("#speed").textContent = `${size(data.summary.speed)}/s`;
   $("#attention").textContent = data.summary.attention;
@@ -26,7 +27,7 @@ function render() {
     const tasks = group.tasks.filter(task => $("#scope").value === "all" || ($("#scope").value === "attention" ? task.attention : task.live));
     if (!tasks.length) continue;
     visible += tasks.length;
-    const section = element("section", undefined, "group"), heading = element("div", undefined, "group-heading"), title = element("h2", `群 ${group.group}`);
+    const section = element("section", undefined, "group"), heading = element("div", undefined, "group-heading"), title = element("h2", chatLabel(group));
     title.append(element("small", `机器人实例：${group.platform}`)); heading.append(title, element("span", `${tasks.length} 个任务`, "count")); section.append(heading);
     const wrap = element("div", undefined, "table-wrap"), table = element("table"), head = element("thead"), header = element("tr");
     for (const title of ["资源 / 任务", "状态", "下载进度", "操作"]) header.append(element("th", title));
@@ -49,7 +50,7 @@ function render() {
         $("#confirm-title").textContent = task.retry_cleanup ? "重试清理本地文件？" : "取消任务并删除文件？";
         $("#confirm-description").textContent = task.retry_cleanup ? "文件已发送成功。本次只重试移除下载器任务和清理本地文件，不会重新上传。删除操作不可恢复。" : "将停止下载器中的此任务，并永久删除它的下载内容、压缩包和临时文件。此操作不可恢复。";
         $("#confirm-cancel").textContent = task.retry_cleanup ? "重试清理" : "取消并删除文件";
-        $("#confirm-name").textContent = `群 ${group.group} · ${task.short_id} · ${task.name}`; $("#confirm").showModal();
+        $("#confirm-name").textContent = `${chatLabel(group)} · ${task.short_id} · ${task.name}`; $("#confirm").showModal();
       };
       action.append(button); row.append(name, state, progress, action); body.append(row);
     }
@@ -69,7 +70,7 @@ async function refresh(manual = false) {
     }
     if (event) status(event, data.groups.some(group => group.tasks.some(task => task.attention)));
     else if (manual) status("列表已更新。");
-    else if (!pending.size && !$("#status").textContent.includes("已取消")) status("已连接 AstrBot。管理面板可管理所有群的插件任务。");
+    else if (!pending.size && !$("#status").textContent.includes("已取消")) status("已连接 AstrBot。管理面板可管理群聊和私聊的插件任务。");
   } catch (error) { status(`刷新失败：${error.message}。当前显示上次成功获取的数据。`, true); }
   finally { loading = false; $("#refresh").disabled = false; }
 }

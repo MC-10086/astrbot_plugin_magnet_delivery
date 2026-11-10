@@ -64,6 +64,7 @@ class Manager:
         self.scheduler = None
         self.submit_lock = asyncio.Lock()
         self.cleaning: set[asyncio.Task] = set()
+        self.notifications: set[asyncio.Task] = set()
 
     def start(self):
         # Never blindly resend a possibly delivered file after a crash.
@@ -79,7 +80,7 @@ class Manager:
                     )
                 else:
                     task.update(
-                        state="upload_unknown", error="上次上传结果未知，请核对群文件后使用 resend"
+                        state="upload_unknown", error="上次上传结果未知，请核对已发送的文件后使用 resend"
                     )
                 self.store.save(task)
         self.scheduler = asyncio.create_task(self._schedule())
@@ -142,7 +143,7 @@ class Manager:
         if current["state"] == "cancelling" and current["id"] in self.running:
             return
         if current["state"] not in CANCELLABLE:
-            raise ValueError("此状态不能取消清理；上传结果未知时请先核对群文件")
+            raise ValueError("此状态不能取消清理；上传结果未知时请先核对已发送的文件")
         current.update(cancel=True, state="cancelling")
         self.store.save(current)
         job = self.running.get(current["id"])
@@ -197,7 +198,7 @@ class Manager:
         if not task.get("delivered"):
             task.update(
                 state="upload_unknown",
-                error="未确认发送成功，已保留本地文件；请先核对群文件",
+                error="未确认发送成功，已保留本地文件；请先核对已发送的文件",
                 speed=0,
             )
             self.store.save(task)
@@ -394,7 +395,7 @@ class Manager:
                     await self._message(
                         task,
                         f"任务 {task['id'][:8]}：文件已就绪，已保存在本机，未自动发送。"
-                        f"使用 /magnet send {task['id'][:8]} 发送到本群。",
+                        f"使用 /magnet send {task['id'][:8]} 发送到原会话。",
                     )
                     return
             artifacts = self._artifacts(task)
@@ -410,7 +411,7 @@ class Manager:
             except TimeoutError:
                 task.update(
                     state="upload_unknown",
-                    error="上传超时，结果未知；请先核对群文件，再使用 resend",
+                    error="上传超时，结果未知；请先核对已发送的文件，再使用 resend",
                 )
             except Exception as exc:
                 task.update(
@@ -418,7 +419,7 @@ class Manager:
                     error=(
                         str(exc)
                         if isinstance(exc, DeliveryError)
-                        else "未确认上传结果；请先核对群文件，再使用 resend"
+                        else "未确认上传结果；请先核对已发送的文件，再使用 resend"
                     ),
                 )
             else:
@@ -449,7 +450,7 @@ class Manager:
                     if task["error"]
                     else "，文件已发送，本地文件已清理。"
                     if task.get("cleaned")
-                    else "，文件已交给群文件接口。"
+                    else "，文件已交给 QQ 文件接口。"
                 )
                 + volume_hint,
             )
@@ -480,6 +481,7 @@ class Manager:
 
     async def _download(self, task: dict, backend):
         failures = 0
+        alert_minutes = self.options.get("zero_progress_minutes", 10)
         while True:
             if time.time() - task["created"] > self.options["task_timeout"]:
                 raise TimeoutError("任务总时限")
@@ -530,7 +532,27 @@ class Manager:
                 )
                 self.store.save(task)
                 return
+
+            alert = False
+            if alert_minutes and not task.get("zero_progress_notified"):
+                if status.done > 0:
+                    task.pop("zero_progress_since", None)
+                else:
+                    now = time.time()
+                    since = task.setdefault("zero_progress_since", now)
+                    alert = now - since >= alert_minutes * 60
+                    if alert:
+                        # Persist before sending to avoid duplicate reminders after a reload.
+                        task["zero_progress_notified"] = True
             self.store.save(task)
+            if alert:
+                reminder = asyncio.create_task(self._message(
+                    task,
+                    f"任务 {task['id'][:8]}：已连续约 {alert_minutes} 分钟没有下载到数据，"
+                    f"任务仍在继续。可用 /magnet status {task['id'][:8]} 查看进度。",
+                ))
+                self.notifications.add(reminder)
+                reminder.add_done_callback(self.notifications.discard)
             await asyncio.sleep(self.options["poll_seconds"])
 
     async def _archive(self, task: dict):
@@ -598,8 +620,8 @@ class Manager:
                 raise DeliveryError("待发送文件缺失或大小已改变；原任务未重新下载")
             if item["size"] > self.options["upload_bytes"]:
                 if compressed:
-                    raise DeliveryError("压缩包超过当前群文件上传上限，文件已保留")
-                raise DeliveryError("原文件超过群文件上传上限，请开启压缩后重新提交")
+                    raise DeliveryError("压缩包超过当前文件上传上限，文件已保留")
+                raise DeliveryError("原文件超过文件上传上限，请开启压缩后重新提交")
         task["artifacts"] = items
         return items
 
@@ -612,6 +634,9 @@ class Manager:
             if job not in self.cleaning:
                 job.cancel()
         await asyncio.gather(*self.running.values(), return_exceptions=True)
+        for notice in self.notifications:
+            notice.cancel()
+        await asyncio.gather(*self.notifications, return_exceptions=True)
         for backend in [*self.backends.values(), *self.legacy_backends.values()]:
             await backend.close()
         self.store.close()

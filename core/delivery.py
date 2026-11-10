@@ -126,7 +126,7 @@ def snapshot(config: dict, settings: dict, overrides: dict | None = None) -> dic
         result.update(overrides)
     if not result["auto_send"]:
         if overrides and overrides.get("delete_after_send"):
-            raise DeliveryError("发送后删除本地文件需要先开启自动发送到原群")
+            raise DeliveryError("发送后删除本地文件需要先开启自动发送到原会话")
         result["delete_after_send"] = False
     if result["encrypt"] and not result["compress"]:
         raise DeliveryError("密码保护需要自动压缩；请开启 compress 或关闭 encrypt")

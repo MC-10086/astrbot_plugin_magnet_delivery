@@ -103,7 +103,12 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         result = await self.service.lookup(
             MAGNET + "&tr=https://tracker.test/?passkey=secret&dn=private", "chatA"
         )
-        cached = await self.service.lookup(MAGNET, "chatB")
+        async with self.service.lock:
+            cached = await self.service.lookup(MAGNET, "chatB")
+            other = "magnet:?xt=urn:btih:" + "b" * 40
+            with self.assertRaisesRegex(ValueError, "服务忙"):
+                await self.service.lookup(other, "chatC")
+            self.assertNotIn("chatC", self.service.chats)
         self.assertEqual(result, cached)
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0].url.params["url"], MAGNET)
@@ -126,6 +131,61 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
             await self.service.lookup(MAGNET, "chatA")
         with self.assertRaisesRegex(ValueError, "间隔"):
             await self.service.lookup(MAGNET, "chatB")
+        with self.assertRaisesRegex(ValueError, "间隔"):
+            await self.service.lookup(MAGNET, "chatB")
+        self.assertEqual(len(requests), 1)
+
+    async def test_lookup_retries_connect_error_once_on_the_same_proxy(self):
+        service = PreviewService(proxy="system")
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            if len(requests) == 1:
+                raise httpx.ConnectError("connection refused", request=request)
+            return httpx.Response(200, json=PAYLOAD)
+
+        proxy = "http://127.0.0.1:7897"
+        client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        with (
+            patch("astrbot_plugin_magnet_delivery.core.preview.resolve_proxy",
+                  return_value=proxy) as resolve,
+            patch.object(service, "_client", return_value=client) as create_client,
+        ):
+            result = await service.lookup(MAGNET + "&dn=Example", "group")
+        self.assertEqual(result["name"], PAYLOAD["name"])
+        self.assertEqual([request.url.params["url"] for request in requests], [MAGNET, MAGNET])
+        resolve.assert_called_once_with("system", ENDPOINT)
+        create_client.assert_called_once_with(proxy)
+
+    async def test_batch_previews_two_links_with_one_chat_cooldown_and_global_spacing(self):
+        import time
+
+        second = "magnet:?xt=urn:btih:" + "b" * 40
+        requests = []
+
+        def respond(request):
+            requests.append((request.url.params["url"], time.monotonic()))
+            return httpx.Response(200, json=PAYLOAD)
+
+        self.mock(respond)
+        results = await self.service.lookup_batch([MAGNET, second], "chatA")
+        self.assertEqual([result["hash"] for result in results], ["a" * 40, "b" * 40])
+        self.assertEqual([link for link, _ in requests], [MAGNET, second])
+        self.assertGreaterEqual(requests[1][1] - requests[0][1], 2.99)
+        with self.assertRaisesRegex(ValueError, "频繁"):
+            await self.service.lookup(MAGNET, "chatA")
+
+    async def test_batch_stops_network_requests_after_rate_limit(self):
+        second = "magnet:?xt=urn:btih:" + "b" * 40
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(429)
+
+        self.mock(respond)
+        self.assertEqual(await self.service.lookup_batch([MAGNET, second], "chatA"), [])
         self.assertEqual(len(requests), 1)
 
     async def test_error_empty_invalid_and_oversized_responses(self):

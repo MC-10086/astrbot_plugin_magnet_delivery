@@ -53,6 +53,7 @@ def listing(manager) -> dict:
                 chat=chat,
                 platform=task.get("platform", "未知实例"),
                 group=task.get("group", "未知群聊"),
+                private_user=task["owner"] if task.get("group") == "" else "",
                 tasks=[],
             ),
         )
@@ -86,7 +87,9 @@ def listing(manager) -> dict:
             )
         )
     return dict(
-        groups=sorted(groups.values(), key=lambda item: (item["platform"], item["group"])),
+        groups=sorted(groups.values(), key=lambda item: (
+            item["platform"], item["group"], item["private_user"]
+        )),
         summary=dict(
             active=sum(task["state"] in ACTIVE for task in tasks),
             attention=sum(task["state"] in ATTENTION for task in tasks),

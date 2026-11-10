@@ -293,6 +293,45 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.uploads, [("groupA", task["id"])])
         self.assertEqual(self.fake.stops, [task["id"]])
 
+    async def test_zero_progress_reminds_once_and_survives_task_reload(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        task = await self.manager.submit(self.route, MAGNET, "qb")
+        task.update(state="downloading", remote_id=await self.fake.start(task))
+        clock = task["created"]
+        snapshots = iter([(0, 0), (590, 1), (600, 0), (1199, 0), (1200, 0), (1220, 0)])
+
+        async def poll(current):
+            nonlocal clock
+            sample = next(snapshots, None)
+            if sample is None:
+                raise asyncio.CancelledError
+            offset, done = sample
+            clock = current["created"] + offset
+            self.assertEqual(len(self.messages), int(offset > 1200))
+            return Snapshot(total=11, done=done)
+
+        self.fake.poll = poll
+        with patch(
+            "astrbot_plugin_magnet_delivery.core.manager.time",
+            SimpleNamespace(time=lambda: clock),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.manager._download(task, self.fake)
+            saved = self.manager.store.get(task["id"])
+            self.assertEqual(saved["state"], "downloading")
+            self.assertTrue(saved["zero_progress_notified"])
+            snapshots = iter([(1850, 0), (1900, 0)])
+            with self.assertRaises(asyncio.CancelledError):
+                await self.manager._download(saved, self.fake)
+
+        self.assertEqual(len(self.messages), 1)
+        self.assertEqual(self.messages[0][0], self.route["chat"])
+        self.assertIn("10 分钟没有下载到数据", self.messages[0][1])
+        self.assertEqual(self.fake.stops, [])
+        self.assertEqual(self.fake.cancels, [])
+
     async def test_duplicate_qb_hash_does_not_mark_fresh_task_as_pending_removal(self):
         async def duplicate(task):
             raise QBittorrentDuplicate("qBittorrent 已有相同资源")

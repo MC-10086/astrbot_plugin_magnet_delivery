@@ -1,12 +1,12 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>磁力任务管理</title><link rel="stylesheet" href="./style.css"></head>
 <body><main>
-  <header><div><p class="eyebrow">磁力下载与回传</p><h1>任务管理</h1><p class="muted">按机器人实例和群聊查看下载进度，取消任务并清理文件。</p></div><button id="refresh">立即刷新</button></header>
+  <header><div><p class="eyebrow">磁力下载与回传</p><h1>任务管理</h1><p class="muted">按机器人实例和会话查看下载进度，取消任务并清理文件。</p></div><button id="refresh">立即刷新</button></header>
   <section class="stats" aria-label="任务概况"><div><span>进行中</span><strong id="active">—</strong></div><div><span>总下载速度</span><strong id="speed">—</strong></div><div><span>需要处理</span><strong id="attention">—</strong></div></section>
-  <section class="toolbar"><label>机器人<select id="platform"><option value="">全部实例</option></select></label><label>群聊<select id="group"><option value="">全部群聊</option></select></label><label>状态<select id="scope"><option value="live">进行中与待处理</option><option value="all">全部（含最近记录）</option><option value="attention">仅需要处理</option></select></label><label class="autorefresh"><input id="auto" type="checkbox" checked>每 3 秒自动刷新</label></section>
+  <section class="toolbar"><label>机器人<select id="platform"><option value="">全部实例</option></select></label><label>会话<select id="group"><option value="">全部会话</option></select></label><label>状态<select id="scope"><option value="live">进行中与待处理</option><option value="all">全部（含最近记录）</option><option value="attention">仅需要处理</option></select></label><label class="autorefresh"><input id="auto" type="checkbox" checked>每 3 秒自动刷新</label></section>
   <p id="status" role="status">正在连接 AstrBot…</p><p class="notice">取消会永久删除该任务的下载文件、压缩包及临时文件。上传中的任务无法可靠撤回；停止或清理失败时，可修复连接、权限或文件占用后重试。</p>
-  <div id="groups"></div><p id="empty" hidden>当前筛选下没有任务。可切换群聊或查看全部记录。</p>
+  <div id="groups"></div><p id="empty" hidden>当前筛选下没有任务。可切换会话或查看全部记录。</p>
   <footer id="updated">—</footer>
 </main>
-<dialog id="confirm"><h2 id="confirm-title">取消任务并删除文件？</h2><p id="confirm-name"></p><p id="confirm-description">将停止下载器中的此任务，并永久删除它的下载内容、压缩包和临时文件。此操作不可恢复。</p><p class="muted">其他任务及文件不受影响。已发送到群里的文件不会被撤回。</p><div class="dialog-actions"><button id="back">返回</button><button id="confirm-cancel" class="danger">取消并删除文件</button></div></dialog>
+<dialog id="confirm"><h2 id="confirm-title">取消任务并删除文件？</h2><p id="confirm-name"></p><p id="confirm-description">将停止下载器中的此任务，并永久删除它的下载内容、压缩包和临时文件。此操作不可恢复。</p><p class="muted">其他任务及文件不受影响。已发送的 QQ 文件不会被撤回。</p><div class="dialog-actions"><button id="back">返回</button><button id="confirm-cancel" class="danger">取消并删除文件</button></div></dialog>
 <script type="module" src="./app.js"></script></body></html>

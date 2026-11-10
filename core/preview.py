@@ -194,69 +194,113 @@ class PreviewService:
         async with self._client(proxy) as client:
             yield client, "代理" if proxy else "直连"
 
+    async def _read_preview(self, client, key):
+        # Submit only the hash, without names, tracker passkeys, or task IDs.
+        async with client.stream(
+            "GET", ENDPOINT, params={"url": "magnet:?xt=urn:btih:" + key}
+        ) as response:
+            if response.status_code == 429:
+                self.next_request = time.monotonic() + 60
+                raise ValueError("预览服务额度或频率受限，请至少一分钟后重试")
+            if response.status_code == 404:
+                raise ValueError("预览服务暂未收录此资源")
+            response.raise_for_status()
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+                if len(body) > 262144:
+                    raise ValueError("预览服务响应超过大小限制")
+        return parse_result(json.loads(body), key)
+
     async def lookup(self, magnet: str, chat: str) -> dict:
-        _, key = normalize_magnet(magnet)
+        result, = await self._lookup_results((magnet,), chat)
+        if isinstance(result, ValueError):
+            raise result
+        return result
+
+    async def lookup_batch(self, magnets: list[str], chat: str) -> list[dict]:
+        """Preview one message's distinct magnets under a single chat cooldown."""
+        return [
+            result for result in await self._lookup_results(magnets, chat)
+            if isinstance(result, dict)
+        ]
+
+    async def _lookup_results(self, magnets, chat):
         now = time.monotonic()
         if now - self.chats.get(chat, -1e20) < self.cooldown:
             raise ValueError(f"本聊天预览过于频繁，请等待 {self.cooldown} 秒后再试")
+        keys = list(dict.fromkeys(normalize_magnet(magnet)[1] for magnet in magnets))
+        cached = {}
+        for key in keys:
+            entry = self.cache.get(key)
+            if entry and now - entry[0] < self.cache_seconds:
+                cached[key] = entry[1]
+                self.cache.move_to_end(key)
+        needs_network = len(cached) != len(keys)
+        if needs_network:
+            # Cached previews need no network slot. Rejected lookups consume no chat cooldown.
+            if self.lock.locked():
+                raise ValueError("预览服务忙，请稍后重试")
+            if now < self.next_request:
+                raise ValueError("预览服务请求间隔限制中，请稍后重试")
         self.chats[chat] = now
         self.chats.move_to_end(chat)
         if len(self.chats) > 1024:
             self.chats.popitem(last=False)
-        # Only one request is accepted at once; do not accumulate waiting handlers.
-        if self.lock.locked():
-            raise ValueError("预览服务忙，请稍后重试")
+        if not needs_network:
+            return [cached[key] for key in keys]
         async with self.lock:
-            cached = self.cache.get(key)
-            if cached and now - cached[0] < self.cache_seconds:
-                self.cache.move_to_end(key)
-                return cached[1]
-            if now < self.next_request:
-                raise ValueError("预览服务请求间隔限制中，请稍后重试")
-            self.next_request = now + 3
-            mode = self.connection_mode
-            try:
-                # Submit only the hash, without names, tracker passkeys, or task IDs.
-                async with self._connection(ENDPOINT) as (client, mode), client.stream(
-                    "GET", ENDPOINT, params={"url": "magnet:?xt=urn:btih:" + key}
-                ) as response:
-                    if response.status_code == 429:
-                        self.next_request = time.monotonic() + 60
-                        raise ValueError("预览服务额度或频率受限，请至少一分钟后重试")
-                    if response.status_code == 404:
-                        raise ValueError("预览服务暂未收录此资源")
-                    response.raise_for_status()
-                    body = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        body.extend(chunk)
-                        if len(body) > 262144:
-                            raise ValueError("预览服务响应超过大小限制")
-                result = parse_result(json.loads(body), key)
-            except httpx.TimeoutException:
-                raise ValueError(
-                    f"预览服务请求超时（{mode}），请稍后重试"
-                ) from None
-            except httpx.HTTPStatusError as exc:
-                raise ValueError(
-                    f"预览服务返回 HTTP {exc.response.status_code}（{mode}）"
-                ) from None
-            except httpx.HTTPError as exc:
-                from astrbot.api import logger
+            results = []
+            for key in keys:
+                if key in cached:
+                    results.append(cached[key])
+                    continue
+                delay = self.next_request - time.monotonic()
+                if delay > 3:
+                    continue  # An HTTP 429 suspended network lookups.
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                try:
+                    results.append(await self._fetch_preview(key))
+                except ValueError as exc:
+                    results.append(exc)
+            return results
 
-                # No exception text: it may expose proxy passwords or query URLs.
-                logger.warning(
-                    "WhatsLink connection failed: %s (%s)", type(exc).__name__, mode
-                )
-                raise ValueError(
-                    f"预览服务连接失败（{mode}，{type(exc).__name__}），请检查代理或网络"
-                ) from None
-            except (json.JSONDecodeError, UnicodeError):
-                raise ValueError("预览服务未返回有效 JSON，可能被拦截或服务异常") from None
-            self.cache[key] = (time.monotonic(), result)
-            self.cache.move_to_end(key)
-            if len(self.cache) > 128:
-                self.cache.popitem(last=False)
-            return result
+    async def _fetch_preview(self, key):
+        mode = self.connection_mode
+        try:
+            async with self._connection(ENDPOINT) as (client, mode):
+                self.next_request = time.monotonic() + 3
+                try:
+                    result = await self._read_preview(client, key)
+                except httpx.ConnectError:
+                    # The connection failed before an API response. Reuse the chosen route.
+                    await asyncio.sleep(1)
+                    self.next_request = time.monotonic() + 3
+                    result = await self._read_preview(client, key)
+        except httpx.TimeoutException:
+            raise ValueError(
+                f"预览服务请求超时（{mode}），请稍后重试"
+            ) from None
+        except httpx.HTTPStatusError as exc:
+            raise ValueError(
+                f"预览服务返回 HTTP {exc.response.status_code}（{mode}）"
+            ) from None
+        except httpx.HTTPError as exc:
+            from astrbot.api import logger
+
+            # No exception text: it may expose proxy passwords or query URLs.
+            logger.warning("WhatsLink connection failed: %s (%s)", type(exc).__name__, mode)
+            raise ValueError(
+                f"预览服务连接失败（{mode}，{type(exc).__name__}），请检查代理或网络"
+            ) from None
+        except (json.JSONDecodeError, UnicodeError):
+            raise ValueError("预览服务未返回有效 JSON，可能被拦截或服务异常") from None
+        self.cache[key] = (time.monotonic(), result)
+        self.cache.move_to_end(key)
+        if len(self.cache) > 128:
+            self.cache.popitem(last=False)
+        return result
 
     async def image(self, url: str) -> bytes | None:
         """Download small allowlisted screenshots; never forward arbitrary URLs to QQ."""

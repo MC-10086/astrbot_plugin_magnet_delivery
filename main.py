@@ -2,14 +2,16 @@
 
 import asyncio
 import re
+from itertools import islice
 from pathlib import Path
 
 from aiocqhttp import CQHttp
 from aiocqhttp.api_impl import HttpApi, UnifiedApi, WebSocketReverseApi
 from aiocqhttp.exceptions import ActionFailed, ApiNotAvailable, NetworkError
+from aiocqhttp.exceptions import Error as OneBotError
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Image, Plain
+from astrbot.api.message_components import Forward, Image, Node, Nodes, Plain
 from astrbot.api.star import Context, Star
 from astrbot.api.web import error_response, json_response, request
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -24,6 +26,7 @@ from .core.delivery import (
     preferences,
     snapshot,
 )
+from .core.forward import collect_magnets, forwarded_texts
 from .core.managed_aria2 import ManagedAria2
 from .core.manager import Manager, matching_profile
 from .core.models import chat_key
@@ -32,10 +35,11 @@ from .core.preview import PreviewService, render
 from .core.task_view import listing
 from .core.xunlei_cli import XunleiCLI
 
-HELP = """磁力下载命令 · QQ 群聊
+HELP = """磁力下载命令 · QQ
 < > 内为必填项，[ ] 内为选填项，| 表示任选其一。
-任务编号可填完整编号或至少前 8 位，按当前群和机器人实例查询。
+任务编号可填完整编号或至少前 8 位，按当前会话和机器人实例查询。
 /magnet 可写成 /磁力，preview 可写成 预览。
+私聊需由管理员在 AstrBot 插件配置中启用，白名单留空时对所有 QQ 用户开放。
 
 【帮助、下载和查询】
 /help 或 /magnet-help 或 /magnet [help]　查看这份帮助
@@ -44,23 +48,23 @@ HELP = """磁力下载命令 · QQ 群聊
 单次选项（每对选一个，可组合）
   --compress / --no-compress　压缩开关
   --encrypt / --no-encrypt　密码保护开关
-  --send / --no-send　自动发回本群开关
+  --send / --no-send　自动发回当前会话开关
   --delete-after-send / --no-delete-after-send　发送后清理开关
 /magnet preview <磁力链接|任务编号>　预览名称、大小和已有截图
 /magnet tasks [all]　查看进行中、已就绪或需处理的任务，all 显示最近 20 条记录
 /magnet status <任务编号>　查看下载进度和交付状态
-/magnet delivery　查看本群压缩、加密、发送及清理设置
+/magnet delivery　查看当前会话的压缩、加密、发送及清理设置
 
 【任务操作 · 提交者或管理员】
 /magnet cancel <任务编号>　取消并清理本地文件，上传中无法可靠撤回
-/magnet send <任务编号>　将本机已就绪的文件发回本群
-/magnet resend <任务编号>　核对群文件后重试未确认的上传
+/magnet send <任务编号>　将本机已就绪的文件发回当前会话
+/magnet resend <任务编号>　核对已发送的文件后重试未确认的上传
 /magnet cleanup <任务编号>　重试发送成功后的本地清理
 
 【本群设置 · 群管理员或机器人管理员】
 /magnet test [后端名称]　测试下载器连接
 /magnet on|off　启用或关闭本群新任务
-/magnet auto on|off　开启或关闭磁力链接自动监听
+/magnet auto on|off　开启或关闭本群磁力链接自动下载
 /magnet compress on|off|default　设置自动压缩
 /magnet encrypt on|off|default　设置密码保护，需要开启压缩并在面板配置密码
 /magnet autosend on|off|default　设置是否自动发回本群
@@ -98,6 +102,7 @@ class MagnetDelivery(Star):
         self.config = config
         self.manager = None
         self.preview = None
+        self._forward_lock = asyncio.Lock()
         self.managed_aria2 = None
         self.download_backend = "none"
         self.path_picker = PathPicker(
@@ -236,6 +241,7 @@ class MagnetDelivery(Star):
             "max_files": max(1, int(self.config.get("max_files", 2000))),
             "reserve_bytes": max(64, int(self.config.get("reserve_mib", 512))) * mib,
             "poll_seconds": max(2, int(self.config.get("poll_seconds", 5))),
+            "zero_progress_minutes": max(0, int(self.config.get("zero_progress_minutes", 10))),
             "task_timeout": max(60, int(self.config.get("task_timeout", 21600))),
             "archive_timeout": max(30, int(self.config.get("archive_timeout", 1800))),
             "upload_timeout": max(30, int(self.config.get("upload_timeout", 1800))),
@@ -332,7 +338,7 @@ class MagnetDelivery(Star):
     def route(self, event: AstrMessageEvent) -> dict:
         platform, group, owner = (
             str(event.get_platform_id()),
-            str(event.get_group_id()),
+            str(event.get_group_id() or ""),
             str(event.get_sender_id()),
         )
         return {
@@ -368,9 +374,14 @@ class MagnetDelivery(Star):
             return False  # fail closed, never grant permissions on API failure
 
     async def _notify(self, task: dict, text: str):
+        if not task["group"] and not self._private_allowed(task["owner"]):
+            return
         await self.context.send_message(task["umo"], MessageChain([Plain(text)]))
 
     async def _upload(self, task: dict, archive: Path):
+        group = task["group"]
+        if not group and not self._private_allowed(task["owner"]):
+            raise DeliveryError("私聊权限已关闭或取消，文件保留在本机")
         client = self._client(task["platform"])
         # Only translate a prefix, never accept a path supplied by a chat user.
         local_prefix = self.config.get("qq_local_prefix", "").strip()
@@ -387,11 +398,9 @@ class MagnetDelivery(Star):
             name = f"magnet_{task['id'][:8]}.zip"
             if archive.name.startswith(base + "."):
                 name += archive.name.removeprefix(base)
-        args = {
-            "group_id": int(task["group"]),
-            "file": path,
-            "name": name,
-        }
+        action = "upload_group_file" if group else "upload_private_file"
+        target = {"group_id": int(group)} if group else {"user_id": str(task["owner"])}
+        args = dict(target, file=path, name=name)
         if task.get("self_id"):
             args["self_id"] = task["self_id"]
         api = client
@@ -406,19 +415,20 @@ class MagnetDelivery(Star):
                 ws_api = WebSocketReverseApi(ws_api._api_clients, ws_api._event_clients, timeout)
             api = UnifiedApi(http_api, ws_api)
         try:
-            result = await api.call_action("upload_group_file", **args)
+            result = await api.call_action(action, **args)
         except NetworkError as exc:
             if "timeout" in str(exc).lower():
                 raise TimeoutError from exc
-            raise DeliveryError("QQ 协议连接中断，请先核对群文件，再使用 resend") from exc
+            raise DeliveryError("QQ 协议连接中断，请先核对已发送的文件，再使用 resend") from exc
         except ApiNotAvailable as exc:
-            raise DeliveryError("QQ 群文件接口当前未连接，请检查 NapCat 连接后重试") from exc
+            raise DeliveryError("QQ 文件接口当前未连接，请检查 NapCat 连接后重试") from exc
         except ActionFailed as exc:
             code = exc.result.get("retcode")
             detail = f"（错误码 {code}）" if type(code) is int else ""
-            raise DeliveryError(f"QQ 群文件接口返回失败{detail}，请先核对群文件，再使用 resend") from exc
-        if Manager._should_clean_sent(task):
-            # NapCat's successful upload response supplies the group file ID.
+            raise DeliveryError(f"QQ 文件接口返回失败{detail}，请先核对已发送的文件，再使用 resend") from exc
+        if not group or Manager._should_clean_sent(task):
+            # Private uploads can explicitly return a null file ID. Treat that as unconfirmed
+            # even when local cleanup is disabled.
             data = result.get("data", result) if isinstance(result, dict) else None
             if (
                 not isinstance(data, dict)
@@ -428,10 +438,25 @@ class MagnetDelivery(Star):
                 or result.get("retcode", 0) != 0
             ):
                 raise DeliveryError(
-                    "上传未返回可确认成功的file_id，已保留本地文件；请核对群文件并检查协议端版本，勿直接重复上传"
+                    "上传未返回可确认成功的file_id，已保留本地文件；请核对已发送的文件并检查协议端版本，勿直接重复上传"
                 )
 
+    def _private_allowed(self, owner):
+        owner = str(owner)
+        allowed = self.config.get("allowed_private_users", [])
+        return (
+            self.config.get("private_enabled") is True
+            and isinstance(allowed, list)
+            and owner.isascii()
+            and owner.isdigit()
+            and (not allowed or any(owner == str(value).strip() for value in allowed))
+        )
+
     def _allowed(self, route: dict):
+        if not route["group"]:
+            if not self._private_allowed(route["owner"]):
+                raise ValueError("私聊未启用或此 QQ 号未获授权，请联系 AstrBot 管理员")
+            return
         allowed = [str(x) for x in self.config.get("allowed_groups", [])]
         if allowed and route["group"] not in allowed:
             raise ValueError("本群不在插件允许列表中")
@@ -453,9 +478,93 @@ class MagnetDelivery(Star):
             raise DeliveryError("aria2 自动管理未启动。请检查 aria2 程序路径并重载插件。")
         return await self.manager.submit(route, magnet, backend, overrides)
 
+    async def _send_preview_forward(self, event, text, screenshots) -> str | None:
+        """Return the plain-text fallback if the card send was not confirmed."""
+        sender = str(event.message_obj.self_id)
+        nodes = [Node(name="磁力预览", uin=sender, content=[Plain(text)])]
+        try:
+            async with asyncio.timeout(5):
+                for url in screenshots:
+                    data = await self.preview.image(url)
+                    if data:
+                        nodes.append(Node(
+                            name="磁力预览", uin=sender,
+                            content=[Image.fromBytes(data)],
+                        ))
+        except TimeoutError:
+            # Send the summary and any screenshots already collected.
+            pass
+        try:
+            await event.send(MessageChain([Nodes(nodes)]))
+        except Exception as exc:
+            result = exc.result if isinstance(exc, ActionFailed) else {}
+            retcode = result.get("retcode")
+            detail = str(result.get("message") or result.get("wording") or "")
+            if isinstance(exc, ApiNotAvailable) or retcode == 1404:
+                stage = "合并转发接口不可用"
+            elif "生成节点为空" in detail or "文件处理失败" in detail:
+                stage = "节点准备失败"
+            elif "发送转发消息（res_id" in detail:
+                stage = "已生成卡片，发送未确认"
+            elif "timeout" in detail.lower() or "超时" in detail:
+                stage = "协议端操作超时"
+            else:
+                stage = "协议端未提供可识别的失败阶段"
+            logger.warning(
+                "磁力预览聊天记录发送失败或未确认（%s，%s，OneBot 返回码 %s），改发纯文字",
+                stage, type(exc).__name__, retcode if type(retcode) is int else "未知",
+            )
+            if len(nodes) > 1:
+                text += "\n带图片的预览发送失败或未确认，本次改发文字和截图链接。"
+            return text
+        return None
+
+    async def _preview_results(self, event, target, chat):
+        # AstrBot treats this flag as an opt-out of its default model reply.
+        event.should_call_llm(True)
+        result = await self.preview.lookup(target, chat)
+        async for reply in self._render_preview(event, result):
+            yield reply
+
+    async def _render_preview(self, event, result):
+        text = render(result)
+        screenshots = result["screenshots"] if self.config.get("preview_inline_images", True) else ()
+        if self.config.get("preview_merge_forward", False):
+            fallback = await self._send_preview_forward(event, text, screenshots)
+            if fallback is not None:
+                yield event.plain_result(fallback).use_t2i(False).use_markdown(False)
+            return
+        yield event.plain_result(text)
+        failed_images = 0
+        for index, url in enumerate(screenshots, 1):
+            data = await self.preview.image(url)
+            if not data:
+                continue
+            try:
+                await event.send(MessageChain([Image.fromBytes(data)]))
+            except Exception as exc:
+                # Avoid retrying an image with uncertain delivery. Try the next one.
+                failed_images += 1
+                retcode = exc.result.get("retcode") if isinstance(exc, ActionFailed) else None
+                logger.warning(
+                    "磁力预览第 %d 张截图发送失败（%s，OneBot 返回码 %s）",
+                    index, type(exc).__name__, retcode if type(retcode) is int else "未知",
+                )
+        if failed_images:
+            yield event.plain_result(
+                f"「{result['name']}」有 {failed_images} 张预览图片发送失败或未确认，"
+                "可查看上方的截图链接。"
+            ).use_t2i(False).use_markdown(False)
+
     @filter.command("magnet-help", alias={"help"}, priority=-1)
     async def magnet_help(self, event: AstrMessageEvent):
         """查看磁力下载插件的全部命令。"""
+        if (
+            event.get_platform_name() == "aiocqhttp"
+            and event.is_private_chat()
+            and not self._private_allowed(event.get_sender_id())
+        ):
+            return
         return event.plain_result(HELP).use_t2i(False)
 
     @filter.command("magnet", alias={"磁力"})
@@ -464,8 +573,10 @@ class MagnetDelivery(Star):
         if not self.manager:
             yield event.plain_result("插件尚未初始化，请查看 AstrBot 日志")
             return
-        if event.get_platform_name() != "aiocqhttp" or not event.get_group_id():
-            yield event.plain_result("首版仅支持 QQ OneBot 群聊，暂不支持私聊文件交付")
+        if event.get_platform_name() != "aiocqhttp" or not (
+            event.get_group_id() or event.is_private_chat()
+        ):
+            yield event.plain_result("仅支持 QQ OneBot 群聊和已授权的私聊")
             return
         # Read the original tail so links are not parsed as shell commands.
         text = event.message_str.strip()
@@ -476,6 +587,11 @@ class MagnetDelivery(Star):
         store = self.manager.store
         settings = store.settings(route["chat"])
         try:
+            if not route["group"]:
+                event.should_call_llm(True)
+                self._allowed(route)
+                if action in ("on", "off", "auto"):
+                    raise ValueError("私聊访问由 AstrBot 插件配置管理，这条命令仅用于群聊")
             if action == "help":
                 response = HELP
             elif action == "backends":
@@ -508,14 +624,14 @@ class MagnetDelivery(Star):
                         response = f"{name} 连接失败，请检查服务是否启动、端口和凭据是否一致"
             elif action == "delivery":
                 value = preferences(self.manager.delivery, settings)
-                response = "本群新任务：" + describe(value)
+                response = "当前会话新任务：" + describe(value)
                 try:
                     if value["compress"]:
                         kind, _ = engine(self.manager.delivery, value["encrypt"])
                         response += "\n压缩引擎：" + ARCHIVER_NAMES[kind]
                 except ValueError as exc:
                     response += "\n" + str(exc)
-                response += "\n密码由机器人管理员在管理面板配置，不在群内显示。"
+                response += "\n密码由机器人管理员在管理面板配置，聊天中不会显示。"
             elif action in ("compress", "encrypt", "autosend", "autodelete"):
                 if not await self._is_manager(event):
                     raise ValueError("需要机器人管理员或本群管理员权限")
@@ -539,7 +655,7 @@ class MagnetDelivery(Star):
                 updated = dict(settings, delivery=overrides)
                 value = snapshot(self.manager.delivery, updated)
                 store.set_setting(route["chat"], "delivery", overrides)
-                response = "本群新任务：" + describe(value) + "；已有任务不变。"
+                response = "当前会话新任务：" + describe(value) + "；已有任务不变。"
             elif action == "backend":
                 response = "请在 AstrBot 的插件配置中选择下载器，保存后重载。"
             elif action in ("on", "off", "auto"):
@@ -555,38 +671,24 @@ class MagnetDelivery(Star):
                     if len(parts) != 2 or parts[1] not in ("on", "off"):
                         raise ValueError("用法：/magnet auto on|off")
                     store.set_setting(route["chat"], "auto", parts[1] == "on")
-                    response = "本群自动监听已" + ("开启" if parts[1] == "on" else "关闭")
+                    response = "本群自动下载已" + ("开启" if parts[1] == "on" else "关闭")
             elif action in ("preview", "预览"):
                 self._allowed(route)
                 if not self.config.get("preview_enabled", True) or not self.preview:
                     raise ValueError("预览功能未启用")
                 if len(parts) != 2:
-                    raise ValueError("用法：/magnet preview <磁力链接或本群任务编号>")
+                    raise ValueError("用法：/magnet preview <磁力链接或当前会话的任务编号>")
                 target = parts[1]
                 if not target.lower().startswith("magnet:"):
                     target = store.resolve(route["chat"], target).get("magnet")
                     if not target:
                         raise ValueError("此任务资料已清理，无法再按任务编号预览")
-                result = await self.preview.lookup(target, route["chat"])
-                yield event.plain_result(render(result))
-                if self.config.get("preview_inline_images", True):
-                    for index, url in enumerate(result["screenshots"], 1):
-                        data = await self.preview.image(url)
-                        if not data:
-                            continue
-                        try:
-                            await event.send(MessageChain([Image.fromBytes(data)]))
-                        except Exception as exc:
-                            # Avoid retrying an image with uncertain delivery. Try the next one.
-                            retcode = exc.result.get("retcode") if isinstance(exc, ActionFailed) else None
-                            logger.warning(
-                                "磁力预览第 %d 张截图发送失败（%s，OneBot 返回码 %s）",
-                                index, type(exc).__name__, retcode if type(retcode) is int else "未知",
-                            )
+                async for result in self._preview_results(event, target, route["chat"]):
+                    yield result
                 return
             elif action == "add":
                 self._allowed(route)
-                if not settings.get("enabled", False):
+                if route["group"] and not settings.get("enabled", False):
                     raise ValueError("本群未启用，请管理员执行 /magnet on")
                 if len(parts) < 2:
                     raise ValueError("用法：/magnet add <磁力链接> [选项]")
@@ -662,9 +764,9 @@ class MagnetDelivery(Star):
                     else:
                         await self.manager.resend(task, ready_only=action == "send")
                         response = (
-                            "已排队发送到本群。"
+                            "已排队发送到当前会话。"
                             if action == "send"
-                            else "已排队重发未确认的文件；若此前已上传，群中可能出现重复文件。"
+                            else "已排队重发未确认的文件；若此前已上传，会话中可能出现重复文件。"
                         )
             else:
                 response = HELP
@@ -675,32 +777,99 @@ class MagnetDelivery(Star):
             response = "操作失败，请检查插件配置和服务连接"
         yield event.plain_result(response)
 
+    async def _scan_forward(self, event, route, links, limit):
+        if self._forward_lock.locked():
+            return
+        card = next((part for part in event.get_messages() if isinstance(part, Forward)), None)
+        if card is None or not card.id:
+            return
+        async with self._forward_lock:
+            try:
+                async with asyncio.timeout(5):
+                    payload = await self._client(route["platform"]).call_action(
+                        "get_forward_msg", message_id=card.id, self_id=route["self_id"]
+                    )
+            except (OneBotError, OSError, ValueError):
+                return  # The normal message can still be processed if the card is unavailable.
+
+        collect_magnets(forwarded_texts(payload), links, limit)
+
+    def _auto_download_enabled(self, chat):
+        settings = self.manager.store.settings(chat)
+        return settings.get("enabled", False) and settings.get(
+            "auto", self.config.get("auto_download", False)
+        )
+
+    def _forward_download_limit(self):
+        options = self.manager.options
+        limit = min(options["max_per_chat"], options["max_queue"])
+        if self.config.get("forward_auto_limit_enabled", True):
+            configured = self.config.get("forward_auto_max_links", 3)
+            if type(configured) is not int:
+                configured = 3
+            limit = min(limit, max(1, configured))
+        return limit
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def auto_magnet(self, event: AstrMessageEvent):
-        """Explicit per-group opt-in; no LLM involved."""
-        if not self.manager or event.get_platform_name() != "aiocqhttp":
+        """Handle links in ordinary QQ group messages according to the two opt-ins."""
+        if not self.manager or event.get_platform_name() != "aiocqhttp" or not event.get_group_id():
             return
         text = event.message_str.strip()
-        # The command handler owns explicit add commands.
-        if re.search(r"(?:^|\s)/?(?:magnet|磁力)(?:\s|$)", text, re.IGNORECASE):
+        # The command handler owns explicit commands, including after wake-prefix removal.
+        if (
+            re.match(r"/?(?:magnet|磁力)(?:\s|$)", text, re.IGNORECASE)
+            and (text.startswith("/") or event.is_at_or_wake_command)
+        ):
             return
         route = self.route(event)
-        settings = self.manager.store.settings(route["chat"])
-        if not settings.get("enabled") or not settings.get("auto"):
+        if route["owner"] == route["self_id"]:
+            return
+        auto_download = self._auto_download_enabled(route["chat"])
+        auto_preview = (
+            self.config.get("auto_preview", False)
+            and self.config.get("preview_enabled", True)
+            and self.preview is not None
+        )
+        if not (auto_download or auto_preview):
             return
         try:
             self._allowed(route)
         except ValueError:
             return
-        links = list(
-            dict.fromkeys(re.findall(r"magnet:[?？][^\s<>\"'，。；）]+", text, re.IGNORECASE))
-        )[:3]
-        for link in links:
+        download_limit = 3
+        links = {}
+        collect_magnets((text,), links, 3)
+        if self.config.get("scan_forwarded_magnets", False):
+            if auto_download:
+                download_limit = max(len(links), self._forward_download_limit())
+            forward_limit = max(download_limit if auto_download else 0, 3 if auto_preview else 0)
+            if len(links) < forward_limit:
+                await self._scan_forward(event, route, links, forward_limit)
+        if auto_download:
+            for link in islice(links.values(), download_limit):
+                # Reading the card and sending queue notices yield to other chat commands.
+                if not self.manager or not self._auto_download_enabled(route["chat"]):
+                    break
+                try:
+                    task = await self._submit_download(route, link)
+                    yield event.plain_result(f"磁力任务已排队：{task['id'][:8]} [{task['backend']}]")
+                except ValueError as exc:
+                    yield event.plain_result("磁力任务：" + str(exc))
+        if auto_preview and links:
             try:
-                task = await self._submit_download(route, link)
-                yield event.plain_result(f"磁力任务已排队：{task['id'][:8]} [{task['backend']}]")
-            except ValueError as exc:
-                yield event.plain_result("磁力任务：" + str(exc))
+                targets = list(islice(links.values(), 3))
+                if len(targets) == 1:
+                    async for reply in self._preview_results(event, targets[0], route["chat"]):
+                        yield reply
+                else:
+                    event.should_call_llm(True)
+                    for result in await self.preview.lookup_batch(targets, route["chat"]):
+                        async for reply in self._render_preview(event, result):
+                            yield reply
+            except ValueError:
+                # Ordinary messages should not generate cooldown or service-error replies.
+                pass
 
     async def terminate(self):
         if self.preview:
