@@ -147,7 +147,7 @@ def render(result: dict) -> str:
     amount = f"{amount / 1024 / 1024:.1f} MiB" if amount is not None else "未知"
     count = result["count"] if result["count"] is not None else "未知"
     lines = [
-        "磁力预览（未创建下载任务）",
+        "磁力预览",
         "名称：" + result["name"],
         "类型：" + result["file_type"],
         f"大小：{amount}；文件数：{count}",
@@ -213,23 +213,25 @@ class PreviewService:
         return parse_result(json.loads(body), key)
 
     async def lookup(self, magnet: str, chat: str) -> dict:
-        result, = await self._lookup_results((magnet,), chat)
+        result, = await self._lookup_results([normalize_magnet(magnet)[1]], chat)
         if isinstance(result, ValueError):
             raise result
         return result
 
-    async def lookup_batch(self, magnets: list[str], chat: str) -> list[dict]:
+    async def lookup_batch(
+        self, magnets: list[str], chat: str
+    ) -> list[tuple[str, dict | ValueError]]:
         """Preview one message's distinct magnets under a single chat cooldown."""
-        return [
-            result for result in await self._lookup_results(magnets, chat)
-            if isinstance(result, dict)
-        ]
+        keys = list(dict.fromkeys(normalize_magnet(magnet)[1] for magnet in magnets))
+        if not keys:
+            return []
+        results = await self._lookup_results(keys, chat)
+        return list(zip(keys, results, strict=True))
 
-    async def _lookup_results(self, magnets, chat):
+    async def _lookup_results(self, keys, chat):
         now = time.monotonic()
         if now - self.chats.get(chat, -1e20) < self.cooldown:
             raise ValueError(f"本聊天预览过于频繁，请等待 {self.cooldown} 秒后再试")
-        keys = list(dict.fromkeys(normalize_magnet(magnet)[1] for magnet in magnets))
         cached = {}
         for key in keys:
             entry = self.cache.get(key)
@@ -237,18 +239,23 @@ class PreviewService:
                 cached[key] = entry[1]
                 self.cache.move_to_end(key)
         needs_network = len(cached) != len(keys)
+        unavailable = None
         if needs_network:
-            # Cached previews need no network slot. Rejected lookups consume no chat cooldown.
             if self.lock.locked():
-                raise ValueError("预览服务忙，请稍后重试")
-            if now < self.next_request:
-                raise ValueError("预览服务请求间隔限制中，请稍后重试")
+                unavailable = "预览服务忙，本条尚未查询"
+            elif now < self.next_request:
+                unavailable = "预览服务请求间隔限制中，本条尚未查询"
+            # A network rejection with no cached results consumes no chat cooldown.
+            if unavailable and not cached:
+                raise ValueError(unavailable)
         self.chats[chat] = now
         self.chats.move_to_end(chat)
         if len(self.chats) > 1024:
             self.chats.popitem(last=False)
         if not needs_network:
             return [cached[key] for key in keys]
+        if unavailable:
+            return [cached[key] if key in cached else ValueError(unavailable) for key in keys]
         async with self.lock:
             results = []
             for key in keys:
@@ -257,7 +264,8 @@ class PreviewService:
                     continue
                 delay = self.next_request - time.monotonic()
                 if delay > 3:
-                    continue  # An HTTP 429 suspended network lookups.
+                    results.append(ValueError("服务限流，本条尚未查询"))
+                    continue
                 if delay > 0:
                     await asyncio.sleep(delay)
                 try:

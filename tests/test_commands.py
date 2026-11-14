@@ -26,7 +26,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.plugin = object.__new__(MagnetDelivery)
-        self.plugin.config = {"download_backend": "qb"}
+        self.plugin.config = {"download_backend": "qb", "preview": {}}
         self.plugin.download_backend = "qb"
         self.plugin.context = SimpleNamespace()
         self.plugin.preview = PreviewService()
@@ -457,7 +457,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertEqual([r async for r in self.plugin.auto_magnet(event)], [])
             lookup.assert_not_awaited()
-            self.plugin.config["auto_preview"] = True
+            self.plugin.config["preview"]["auto_preview"] = True
             blocked = self.event("magnet preview " + link)
             blocked.is_at_or_wake_command = True
             self.assertEqual([r async for r in self.plugin.auto_magnet(blocked)], [])
@@ -472,7 +472,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             fetch.assert_awaited_once_with(screenshot)
             fetch.reset_mock()
             event.send.reset_mock()
-            self.plugin.config["preview_inline_images"] = False
+            self.plugin.config["preview"]["preview_inline_images"] = False
             self.assertIn(screenshot, [r async for r in self.plugin.auto_magnet(event)][0])
             self.assertIn(screenshot, await self.command("/magnet preview " + link))
             fetch.assert_not_awaited()
@@ -506,12 +506,13 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             "hash": "a" * 40, "name": "Example", "file_type": "video",
             "size": 100, "count": 1, "screenshots": [],
         }
-        self.plugin.config["auto_preview"] = True
+        self.plugin.config["preview"]["auto_preview"] = True
         second_preview = dict(preview, hash="b" * 40, name="Second")
         with (
             patch.object(self.plugin, "_client", return_value=client),
             patch.object(
-                self.plugin.preview, "lookup_batch", return_value=[preview, second_preview]
+                self.plugin.preview, "lookup_batch",
+                return_value=[("a" * 40, preview), ("b" * 40, second_preview)],
             ) as lookup,
         ):
             card_only = self.event("")
@@ -542,24 +543,30 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_auto_preview_detects_two_links_even_when_they_touch(self):
         from unittest.mock import patch
 
+        from astrbot.api.event import MessageEventResult
+
         first = "magnet:?xt=urn:btih:" + "a" * 40
         second = "magnet:?xt=urn:btih:" + "b" * 40
         first_preview = {
             "hash": "a" * 40, "name": "First", "file_type": "video",
             "size": 100, "count": 1, "screenshots": [],
         }
-        second_preview = dict(first_preview, hash="b" * 40, name="Second")
-        self.plugin.config["auto_preview"] = True
+        self.plugin.config["preview"]["auto_preview"] = True
         event = self.event(first + "," + second)
+        event.plain_result = lambda text: MessageEventResult().message(text)
         with patch.object(
-            self.plugin.preview, "lookup_batch", return_value=[first_preview, second_preview]
+            self.plugin.preview, "lookup_batch",
+            return_value=[("a" * 40, first_preview), ("b" * 40, ValueError("暂未收录"))],
         ) as lookup:
             replies = [r async for r in self.plugin.auto_magnet(event)]
         targets = lookup.await_args.args[0]
         self.assertEqual([normalize_magnet(link)[1] for link in targets], ["a" * 40, "b" * 40])
         self.assertEqual(len(replies), 2)
-        self.assertIn("First", replies[0])
-        self.assertIn("Second", replies[1])
+        self.assertIn("第 1/2 条", replies[0].chain[0].text)
+        self.assertIn("First", replies[0].chain[0].text)
+        self.assertRegex(replies[1].chain[0].text, r"第 2/2 条.*暂未收录.*预览编号：[0-9a-f]{8}")
+        with patch.object(self.plugin.preview, "lookup_batch", side_effect=ValueError("预览冷却")):
+            self.assertEqual([r async for r in self.plugin.auto_magnet(event)], [])
 
     async def test_forward_download_limit_default_custom_and_disabled(self):
         from unittest.mock import AsyncMock, patch
@@ -703,7 +710,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         )
         # Preview is independent of the download on/off switch.
         response = await self.command("/magnet preview magnet:?xt=urn:btih:" + "c" * 40)
-        self.assertIn("未创建下载任务", response)
+        self.assertEqual(response.splitlines()[0], "磁力预览")
         self.assertIn("Example", response)
         self.assertEqual(self.plugin.manager.store.list(), [])
 
@@ -734,6 +741,15 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.args[0] for item in fetch.await_args_list], urls)
         self.assertEqual(event.send.await_count, 3)
 
+        event.send.reset_mock(side_effect=True)
+        with (
+            patch.object(self.plugin.preview, "lookup", return_value=result),
+            patch.object(self.plugin.preview, "image", return_value=None),
+        ):
+            responses = [item async for item in self.plugin.magnet(event)]
+        self.assertIn("「test」有 3 张预览图片未能获取", responses[-1].chain[0].text)
+        event.send.assert_not_awaited()
+
     async def test_merged_preview_sends_one_card_for_manual_and_automatic_requests(self):
         from unittest.mock import AsyncMock, patch
 
@@ -743,7 +759,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             "hash": "a" * 40, "name": "Example", "file_type": "video",
             "size": 100, "count": 1, "screenshots": urls,
         }
-        self.plugin.config.update(auto_preview=True, preview_merge_forward=True)
+        self.plugin.config["preview"].update(auto_preview=True, preview_merge_forward=True)
         with (
             patch.object(self.plugin.preview, "lookup", return_value=result),
             patch.object(self.plugin.preview, "image", side_effect=[None, b"image"]) as fetch,
@@ -758,13 +774,14 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(nodes), 2)
             self.assertEqual(nodes[0]["data"]["user_id"], "999")
             self.assertIn(urls[0], nodes[0]["data"]["content"][0]["data"]["text"])
+            self.assertIn("1 张预览图片未能获取", nodes[0]["data"]["content"][0]["data"]["text"])
             self.assertEqual(
                 nodes[1]["data"]["content"],
                 [{"type": "image", "data": {"file": "base64://aW1hZ2U="}}],
             )
 
             fetch.reset_mock()
-            self.plugin.config["preview_inline_images"] = False
+            self.plugin.config["preview"]["preview_inline_images"] = False
             automatic = self.event("分享 " + link)
             automatic.send = AsyncMock()
             self.assertEqual([r async for r in self.plugin.auto_magnet(automatic)], [])
@@ -777,7 +794,6 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import AsyncMock, patch
 
         from aiocqhttp.exceptions import ActionFailed, NetworkError
-        from astrbot.api.event import MessageEventResult
 
         link = "magnet:?xt=urn:btih:" + "a" * 40
         screenshot = "https://whatslink.info/image/1"
@@ -785,7 +801,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             "hash": "a" * 40, "name": "Example", "file_type": "video",
             "size": 100, "count": 1, "screenshots": [screenshot],
         }
-        self.plugin.config["preview_merge_forward"] = True
+        self.plugin.config["preview"]["preview_merge_forward"] = True
         errors = (
             ActionFailed({"retcode": 1404}),
             ActionFailed({"retcode": 1200, "wording": "转发消息失败，生成节点为空"}),
@@ -799,23 +815,22 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             for error in errors:
                 with self.subTest(error=error):
                     event = self.event("/magnet preview " + link)
-                    event.plain_result = lambda text: MessageEventResult().message(text)
-                    event.send = AsyncMock(side_effect=error)
+                    event.send = AsyncMock(side_effect=[error, None])
                     replies = [r async for r in self.plugin.magnet(event)]
-                    self.assertEqual(len(replies), 1)
-                    self.assertEqual(len(replies[0].chain), 1)
-                    self.assertIn("Example", replies[0].chain[0].text)
-                    self.assertIn(screenshot, replies[0].chain[0].text)
-                    self.assertIn("带图片的预览发送失败或未确认", replies[0].chain[0].text)
-                    self.assertFalse(replies[0].use_t2i_)
-                    self.assertFalse(replies[0].use_markdown_)
-                    event.send.assert_awaited_once()
+                    self.assertEqual(replies, [])
+                    self.assertEqual(event.send.await_count, 2)
+                    chain = event.send.await_args.args[0].chain
+                    self.assertEqual(len(chain), 1)
+                    self.assertIn("Example", chain[0].text)
+                    self.assertIn(screenshot, chain[0].text)
+                    self.assertIn("带图片的预览发送失败或未确认", chain[0].text)
+                    self.assertRegex(chain[0].text, r"预览编号：[0-9a-f]{8}")
                     self.assertTrue(event.call_llm)
 
-            self.plugin.config["preview_inline_images"] = False
-            replies = [r async for r in self.plugin.magnet(event)]
-            self.assertEqual(len(replies), 1)
-            self.assertNotIn("带图片的预览发送失败或未确认", replies[0].chain[0].text)
+            self.plugin.config["preview"]["preview_inline_images"] = False
+            event.send = AsyncMock(side_effect=[errors[0], None])
+            self.assertEqual([r async for r in self.plugin.magnet(event)], [])
+            self.assertNotIn("带图片的预览发送失败或未确认", event.send.await_args.args[0].chain[0].text)
 
     async def test_preview_task_id_remains_chat_scoped_and_respects_whitelist(self):
         route = self.plugin.route(self.event(""))

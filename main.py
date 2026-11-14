@@ -4,6 +4,7 @@ import asyncio
 import re
 from itertools import islice
 from pathlib import Path
+from uuid import uuid4
 
 from aiocqhttp import CQHttp
 from aiocqhttp.api_impl import HttpApi, UnifiedApi, WebSocketReverseApi
@@ -16,7 +17,12 @@ from astrbot.api.star import Context, Star
 from astrbot.api.web import error_response, json_response, request
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-from .core.configuration import configured_profiles, download_directory, download_selection
+from .core.configuration import (
+    configured_profiles,
+    download_directory,
+    download_selection,
+    migrate_preview_config,
+)
 from .core.delivery import (
     ARCHIVER_NAMES,
     DEFAULTS,
@@ -117,6 +123,8 @@ class MagnetDelivery(Star):
                 ("tasks", self.tasks_get, "GET"),
                 ("tasks/cancel", self.tasks_cancel, "POST"),
                 ("tasks/cleanup", self.tasks_cleanup, "POST"),
+                ("tasks/send", self.tasks_send, "POST"),
+                ("tasks/resend", self.tasks_resend, "POST"),
             ):
                 context.register_web_api(
                     "/astrbot_plugin_magnet_delivery/" + route, handler, [method], "磁力任务管理"
@@ -130,17 +138,26 @@ class MagnetDelivery(Star):
         return json_response(listing(self.manager), headers={"Cache-Control": "no-store"})
 
     async def tasks_cancel(self):
-        return await self._task_action(cleanup=False)
+        return await self._task_action("cancel")
 
     async def tasks_cleanup(self):
-        return await self._task_action(cleanup=True)
+        return await self._task_action("cleanup")
 
-    async def _task_action(self, *, cleanup: bool):
+    async def tasks_send(self):
+        return await self._task_action("send")
+
+    async def tasks_resend(self):
+        return await self._task_action("resend")
+
+    async def _task_action(self, action: str):
         if not request.username:
             return error_response("请先登录 AstrBot 管理面板", status_code=401)
-        if not self.manager or self.manager.closing:
+        manager = self.manager
+        if not manager or manager.closing:
             return error_response("插件正在重载，请稍后刷新", status_code=503)
         payload = await request.json(default={})
+        if manager is not self.manager or manager.closing:
+            return error_response("插件正在重载，请稍后刷新", status_code=503)
         if (
             not isinstance(payload, dict)
             or not isinstance(payload.get("id"), str)
@@ -148,25 +165,24 @@ class MagnetDelivery(Star):
             or not isinstance(payload.get("chat"), str)
         ):
             return error_response("请选择有效任务", status_code=400)
-        task = self.manager.store.get(payload["id"])
+        task = manager.store.get(payload["id"])
         if not task or task["chat"] != payload["chat"]:
             return error_response("当前聊天中没有此任务，请刷新列表", status_code=404)
+        if action == "resend" and payload.get("confirmed") is not True:
+            return error_response("请先核对 QQ 中已收到的文件", status_code=400)
         try:
-            if cleanup:
-                await self.manager.retry_sent_cleanup(task)
+            if action in ("send", "resend"):
+                if not task["group"] and not self._private_allowed(task["owner"]):
+                    raise ValueError("此私聊已失去授权")
+                await manager.resend(task, ready_only=action == "send")
+                message = "已排队发送到原会话。" if action == "send" else "已排队重发未确认的文件。"
+            elif action == "cleanup":
+                await manager.retry_sent_cleanup(task)
+                message = "已排队重试本地清理，不会重新上传文件。"
             else:
-                await self.manager.cancel(task)
-            return json_response(
-                {
-                    "accepted": True,
-                    "message": (
-                        "已排队重试本地清理，不会重新上传文件。"
-                        if cleanup
-                        else "正在停止下载并清理文件，请等待最终状态。"
-                    ),
-                },
-                status_code=202,
-            )
+                await manager.cancel(task)
+                message = "正在停止下载并清理文件，请等待最终状态。"
+            return json_response({"accepted": True, "message": message}, status_code=202)
         except ValueError as exc:
             return error_response(str(exc), status_code=409)
 
@@ -223,6 +239,8 @@ class MagnetDelivery(Star):
             raise
 
     async def _initialize(self):
+        if migrate_preview_config(self.config) and hasattr(self.config, "save_config"):
+            self.config.save_config()
         root = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_magnet_delivery"
         self.download_backend, advanced_name = download_selection(self.config)
         config = dict(self.config, advanced_name=advanced_name)
@@ -257,11 +275,12 @@ class MagnetDelivery(Star):
             self.config["default_backend"] = ""
             self.config.save_config()
         self.manager.start()
+        preview_config = self.config.get("preview", {})
         self.preview = PreviewService(
-            proxy=self.config.get("preview_proxy", "system"),
-            cooldown=max(1, int(self.config.get("preview_cooldown", 15))),
-            cache_seconds=max(30, int(self.config.get("preview_cache_seconds", 3600))),
-            image_hosts=self.config.get(
+            proxy=preview_config.get("preview_proxy", "system"),
+            cooldown=max(1, int(preview_config.get("preview_cooldown", 15))),
+            cache_seconds=max(30, int(preview_config.get("preview_cache_seconds", 3600))),
+            image_hosts=preview_config.get(
                 "preview_image_hosts", ["whatslink.info", ".whatslink.info"]
             ),
         )
@@ -478,22 +497,27 @@ class MagnetDelivery(Star):
             raise DeliveryError("aria2 自动管理未启动。请检查 aria2 程序路径并重载插件。")
         return await self.manager.submit(route, magnet, backend, overrides)
 
-    async def _send_preview_forward(self, event, text, screenshots) -> str | None:
+    async def _send_preview_forward(self, event, text, screenshots, preview_id) -> str | None:
         """Return the plain-text fallback if the card send was not confirmed."""
         sender = str(event.message_obj.self_id)
-        nodes = [Node(name="磁力预览", uin=sender, content=[Plain(text)])]
+        images = []
         try:
             async with asyncio.timeout(5):
-                for url in screenshots:
+                for index, url in enumerate(screenshots, 1):
                     data = await self.preview.image(url)
+                    logger.info("磁力预览 %s：截图 %d %s", preview_id, index, "已获取" if data else "未获取")
                     if data:
-                        nodes.append(Node(
+                        images.append(Node(
                             name="磁力预览", uin=sender,
                             content=[Image.fromBytes(data)],
                         ))
         except TimeoutError:
             # Send the summary and any screenshots already collected.
-            pass
+            logger.info("磁力预览 %s：收集截图超时", preview_id)
+        missing = len(screenshots) - len(images)
+        if missing:
+            text += f"\n有 {missing} 张预览图片未能获取，可查看截图链接。"
+        nodes = [Node(name="磁力预览", uin=sender, content=[Plain(text)]), *images]
         try:
             await event.send(MessageChain([Nodes(nodes)]))
         except Exception as exc:
@@ -511,35 +535,53 @@ class MagnetDelivery(Star):
             else:
                 stage = "协议端未提供可识别的失败阶段"
             logger.warning(
-                "磁力预览聊天记录发送失败或未确认（%s，%s，OneBot 返回码 %s），改发纯文字",
-                stage, type(exc).__name__, retcode if type(retcode) is int else "未知",
+                "磁力预览 %s：聊天记录发送失败或未确认（%s，%s，OneBot 返回码 %s），改发纯文字",
+                preview_id, stage, type(exc).__name__, retcode if type(retcode) is int else "未知",
             )
-            if len(nodes) > 1:
+            if images:
                 text += "\n带图片的预览发送失败或未确认，本次改发文字和截图链接。"
             return text
+        logger.info("磁力预览 %s：聊天记录发送已确认，附图 %d 张", preview_id, len(images))
         return None
 
     async def _preview_results(self, event, target, chat):
         # AstrBot treats this flag as an opt-out of its default model reply.
         event.should_call_llm(True)
-        result = await self.preview.lookup(target, chat)
-        async for reply in self._render_preview(event, result):
+        preview_id = uuid4().hex[:8]
+        try:
+            result = await self.preview.lookup(target, chat)
+        except ValueError as exc:
+            logger.info("磁力预览 %s：查询未成功", preview_id)
+            raise ValueError(f"{exc}（预览编号 {preview_id}）") from None
+        async for reply in self._render_preview(event, result, preview_id):
             yield reply
 
-    async def _render_preview(self, event, result):
-        text = render(result)
-        screenshots = result["screenshots"] if self.config.get("preview_inline_images", True) else ()
-        if self.config.get("preview_merge_forward", False):
-            fallback = await self._send_preview_forward(event, text, screenshots)
+    async def _render_preview(self, event, result, preview_id, position=""):
+        logger.info("磁力预览 %s：查询成功，返回 %d 个截图链接", preview_id, len(result["screenshots"]))
+        text = f"{position}{render(result)}\n预览编号：{preview_id}"
+        preview_config = self.config.get("preview", {})
+        screenshots = result["screenshots"] if preview_config.get("preview_inline_images", True) else ()
+        if preview_config.get("preview_merge_forward", False):
+            fallback = await self._send_preview_forward(event, text, screenshots, preview_id)
             if fallback is not None:
-                yield event.plain_result(fallback).use_t2i(False).use_markdown(False)
+                try:
+                    await event.send(MessageChain([Plain(fallback)]))
+                except Exception as exc:
+                    logger.warning("磁力预览 %s：纯文字保底发送未确认（%s）", preview_id, type(exc).__name__)
+                else:
+                    logger.info("磁力预览 %s：纯文字保底发送已确认", preview_id)
             return
+        logger.info("磁力预览 %s：文字结果交由 AstrBot 发送", preview_id)
         yield event.plain_result(text)
+        missing_images = 0
         failed_images = 0
         for index, url in enumerate(screenshots, 1):
             data = await self.preview.image(url)
             if not data:
+                missing_images += 1
+                logger.info("磁力预览 %s：截图 %d 未获取", preview_id, index)
                 continue
+            logger.info("磁力预览 %s：截图 %d 已获取", preview_id, index)
             try:
                 await event.send(MessageChain([Image.fromBytes(data)]))
             except Exception as exc:
@@ -547,13 +589,20 @@ class MagnetDelivery(Star):
                 failed_images += 1
                 retcode = exc.result.get("retcode") if isinstance(exc, ActionFailed) else None
                 logger.warning(
-                    "磁力预览第 %d 张截图发送失败（%s，OneBot 返回码 %s）",
-                    index, type(exc).__name__, retcode if type(retcode) is int else "未知",
+                    "磁力预览 %s：第 %d 张截图发送失败（%s，OneBot 返回码 %s）",
+                    preview_id, index, type(exc).__name__, retcode if type(retcode) is int else "未知",
                 )
-        if failed_images:
+            else:
+                logger.info("磁力预览 %s：截图 %d 发送已确认", preview_id, index)
+        if missing_images or failed_images:
+            issues = []
+            if missing_images:
+                issues.append(f"{missing_images} 张预览图片未能获取")
+            if failed_images:
+                issues.append(f"{failed_images} 张预览图片发送失败或未确认")
             yield event.plain_result(
-                f"「{result['name']}」有 {failed_images} 张预览图片发送失败或未确认，"
-                "可查看上方的截图链接。"
+                f"「{result['name']}」有 {'，'.join(issues)}，"
+                f"可查看上方的截图链接（预览编号 {preview_id}）。"
             ).use_t2i(False).use_markdown(False)
 
     @filter.command("magnet-help", alias={"help"}, priority=-1)
@@ -674,7 +723,8 @@ class MagnetDelivery(Star):
                     response = "本群自动下载已" + ("开启" if parts[1] == "on" else "关闭")
             elif action in ("preview", "预览"):
                 self._allowed(route)
-                if not self.config.get("preview_enabled", True) or not self.preview:
+                preview_config = self.config.get("preview", {})
+                if not preview_config.get("preview_enabled", True) or not self.preview:
                     raise ValueError("预览功能未启用")
                 if len(parts) != 2:
                     raise ValueError("用法：/magnet preview <磁力链接或当前会话的任务编号>")
@@ -826,9 +876,10 @@ class MagnetDelivery(Star):
         if route["owner"] == route["self_id"]:
             return
         auto_download = self._auto_download_enabled(route["chat"])
+        preview_config = self.config.get("preview", {})
         auto_preview = (
-            self.config.get("auto_preview", False)
-            and self.config.get("preview_enabled", True)
+            preview_config.get("auto_preview", False)
+            and preview_config.get("preview_enabled", True)
             and self.preview is not None
         )
         if not (auto_download or auto_preview):
@@ -864,8 +915,19 @@ class MagnetDelivery(Star):
                         yield reply
                 else:
                     event.should_call_llm(True)
-                    for result in await self.preview.lookup_batch(targets, route["chat"]):
-                        async for reply in self._render_preview(event, result):
+                    outcomes = await self.preview.lookup_batch(targets, route["chat"])
+                    for index, (key, result) in enumerate(outcomes, 1):
+                        preview_id = uuid4().hex[:8]
+                        position = f"第 {index}/{len(outcomes)} 条"
+                        if isinstance(result, ValueError):
+                            logger.info("磁力预览 %s：%s查询未成功", preview_id, position)
+                            yield event.plain_result(
+                                f"{position}磁力（{key[:8]}）：{result}。预览编号：{preview_id}"
+                            ).use_t2i(False).use_markdown(False)
+                            continue
+                        async for reply in self._render_preview(
+                            event, result, preview_id, position + " · "
+                        ):
                             yield reply
             except ValueError:
                 # Ordinary messages should not generate cooldown or service-error replies.

@@ -247,6 +247,47 @@ class CancellationTests(unittest.IsolatedAsyncioTestCase):
         self.manager.upload.assert_not_awaited()
 
     @unittest.skipUnless(os.environ.get("ASTRBOT_APP_PATH"), "Needs real AstrBot")
+    async def test_web_delivery_requires_correct_state_and_explicit_resend_confirmation(self):
+        from astrbot_plugin_magnet_delivery.main import MagnetDelivery
+
+        plugin = object.__new__(MagnetDelivery)
+        plugin.manager = self.manager
+        with patch("astrbot_plugin_magnet_delivery.main.request", SimpleNamespace(username=None)):
+            self.assertEqual((await plugin.tasks_send()).status_code, 401)
+            self.assertEqual((await plugin.tasks_resend()).status_code, 401)
+        task = await self.prepared()
+        task.update(state="ready")
+        self.manager.store.save(task)
+        body = {"id": task["id"], "chat": task["chat"]}
+
+        async def body_during_reload(**kwargs):
+            plugin.manager = None
+            return body
+
+        interrupted = SimpleNamespace(username="admin", json=body_during_reload)
+        with patch("astrbot_plugin_magnet_delivery.main.request", interrupted):
+            self.assertEqual((await plugin.tasks_send()).status_code, 503)
+        self.assertEqual(self.manager.store.get(task["id"])["state"], "ready")
+        plugin.manager = self.manager
+        req = SimpleNamespace(username="admin", json=AsyncMock(return_value=body))
+        with patch("astrbot_plugin_magnet_delivery.main.request", req):
+            req.json.return_value = dict(body, chat="other")
+            self.assertEqual((await plugin.tasks_send()).status_code, 404)
+            req.json.return_value = body
+            self.assertEqual((await plugin.tasks_send()).status_code, 202)
+            self.assertEqual((await plugin.tasks_send()).status_code, 409)
+            saved = self.manager.store.get(task["id"])
+            self.assertTrue(saved["manual_send"])
+            saved.update(state="upload_unknown")
+            self.manager.store.save(saved)
+            self.assertEqual((await plugin.tasks_send()).status_code, 409)
+            self.assertEqual((await plugin.tasks_resend()).status_code, 400)
+            req.json.return_value = dict(body, confirmed=True)
+            self.assertEqual((await plugin.tasks_resend()).status_code, 202)
+            self.assertEqual((await plugin.tasks_resend()).status_code, 409)
+        self.assertTrue(self.manager.store.get(task["id"])["resend"])
+
+    @unittest.skipUnless(os.environ.get("ASTRBOT_APP_PATH"), "Needs real AstrBot")
     async def test_registered_routes_match_real_astrbot_dispatcher(self):
         from astrbot.api.star import Context
         from astrbot.dashboard.api.plugins import _match_registered_web_api
@@ -260,6 +301,8 @@ class CancellationTests(unittest.IsolatedAsyncioTestCase):
             ("tasks", "GET", plugin.tasks_get),
             ("tasks/cancel", "POST", plugin.tasks_cancel),
             ("tasks/cleanup", "POST", plugin.tasks_cleanup),
+            ("tasks/send", "POST", plugin.tasks_send),
+            ("tasks/resend", "POST", plugin.tasks_resend),
             ("paths", "GET", plugin.paths_get),
         ):
             result = _match_registered_web_api(

@@ -109,6 +109,12 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ValueError, "服务忙"):
                 await self.service.lookup(other, "chatC")
             self.assertNotIn("chatC", self.service.chats)
+            mixed = await self.service.lookup_batch([other, MAGNET], "chatD")
+            self.assertIn("尚未查询", str(mixed[0][1]))
+            self.assertEqual(mixed[1][1], result)
+        mixed = await self.service.lookup_batch([MAGNET, other], "chatE")
+        self.assertEqual(mixed[0][1], result)
+        self.assertIn("间隔限制", str(mixed[1][1]))
         self.assertEqual(result, cached)
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0].url.params["url"], MAGNET)
@@ -118,6 +124,8 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Example video", text)
         with self.assertRaisesRegex(ValueError, "频繁"):
             await self.service.lookup(MAGNET, "chatA")
+        with self.assertRaisesRegex(ValueError, "频繁"):
+            await self.service.lookup_batch([MAGNET, other], "chatA")
 
     async def test_rate_limit_stops_further_api_calls(self):
         requests = []
@@ -170,7 +178,9 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
 
         self.mock(respond)
         results = await self.service.lookup_batch([MAGNET, second], "chatA")
-        self.assertEqual([result["hash"] for result in results], ["a" * 40, "b" * 40])
+        self.assertEqual([(key, result["hash"]) for key, result in results], [
+            ("a" * 40, "a" * 40), ("b" * 40, "b" * 40)
+        ])
         self.assertEqual([link for link, _ in requests], [MAGNET, second])
         self.assertGreaterEqual(requests[1][1] - requests[0][1], 2.99)
         with self.assertRaisesRegex(ValueError, "频繁"):
@@ -185,7 +195,10 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(429)
 
         self.mock(respond)
-        self.assertEqual(await self.service.lookup_batch([MAGNET, second], "chatA"), [])
+        results = await self.service.lookup_batch([MAGNET, second], "chatA")
+        self.assertEqual([key for key, _ in results], ["a" * 40, "b" * 40])
+        self.assertIn("额度或频率受限", str(results[0][1]))
+        self.assertIn("尚未查询", str(results[1][1]))
         self.assertEqual(len(requests), 1)
 
     async def test_error_empty_invalid_and_oversized_responses(self):

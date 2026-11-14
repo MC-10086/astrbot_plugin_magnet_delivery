@@ -11,6 +11,7 @@ SOURCE_FILES = (
     "_conf_schema.json",
     "build_release.py",
     "CHANGELOG.md",
+    "logo.png",
     "main.py",
     "metadata.yaml",
     "pyproject.toml",
@@ -52,6 +53,7 @@ def main():
         assert package.testzip() is None
         assert root.name + "/metadata.yaml" in package.namelist()
         assert root.name + "/main.py" in package.namelist()
+        assert root.name + "/logo.png" in package.namelist()
     print(destination.name)
     print("SHA256", hashlib.sha256(destination.read_bytes()).hexdigest())
 

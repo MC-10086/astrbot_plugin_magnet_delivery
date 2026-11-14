@@ -9,6 +9,31 @@ from .xunlei_cli import discover_cli
 
 DOWNLOAD_BACKENDS = ("none", "xunlei_cli", "qb", "aria2_auto", "aria2", "advanced")
 
+PREVIEW_KEYS = (
+    "preview_enabled",
+    "auto_preview",
+    "preview_inline_images",
+    "preview_merge_forward",
+    "preview_proxy",
+    "preview_image_hosts",
+    "preview_cooldown",
+    "preview_cache_seconds",
+)
+
+
+def migrate_preview_config(config: dict) -> bool:
+    """Move old top-level settings into the preview form once."""
+    preview = config.get("preview", {})
+    if preview.get("legacy_migrated"):
+        return False
+    # AstrBot drops keys missing from the schema before the plugin starts.
+    # Keep the old fields hidden so the loader can pass their values through.
+    legacy = {key: config[key] for key in PREVIEW_KEYS if key in config}
+    config["preview"] = {**preview, **legacy, "legacy_migrated": True}
+    if "preview_proxy" in config:
+        config["preview_proxy"] = "system"  # Keep proxy credentials only in the new field.
+    return True
+
 
 def load_profiles(raw: str, default_root: Path | None = None) -> dict:
     """Keep the original JSON format and profile identities backward compatible."""

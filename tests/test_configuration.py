@@ -11,6 +11,7 @@ from astrbot_plugin_magnet_delivery.core.configuration import (
     configured_profiles,
     download_directory,
     load_profiles,
+    migrate_preview_config,
 )
 from astrbot_plugin_magnet_delivery.core.manager import identity
 
@@ -141,14 +142,45 @@ class ConfigurationTests(unittest.TestCase):
     def test_real_astrbot_schema_upgrades_legacy_without_changing_existing_fields(self):
         sys.path.insert(0, os.environ["ASTRBOT_APP_PATH"])
         from astrbot.api import AstrBotConfig
+        from astrbot.dashboard.services.config_service import validate_config
 
         schema = json.loads(
             (Path(__file__).parents[1] / "_conf_schema.json").read_text(encoding="utf-8")
         )
         path = Path(self.tmp.name) / "plugin_config.json"
-        original = {"backends_json": "[]", "default_backend": "custom", "preview_proxy": ""}
-        path.write_text(json.dumps(original), encoding="utf-8")
+        original = {"backends_json": "[]", "default_backend": "custom", "auto_download": True}
+        legacy_preview = {
+            "preview_enabled": False,
+            "auto_preview": True,
+            "preview_inline_images": False,
+            "preview_merge_forward": True,
+            "preview_proxy": "",
+            "preview_image_hosts": [],
+            "preview_cooldown": 42,
+            "preview_cache_seconds": 600,
+        }
+        path.write_text(json.dumps({**original, **legacy_preview}), encoding="utf-8")
         config = AstrBotConfig(str(path), schema=schema)
+        self.assertTrue(migrate_preview_config(config))
+        config.save_config()
+        config = AstrBotConfig(str(path), schema=schema)
+        self.assertEqual(config["preview"], {**legacy_preview, "legacy_migrated": True})
+        self.assertEqual(config["preview_proxy"], "system")
+        self.assertFalse(migrate_preview_config(config))
+        config["preview"]["preview_enabled"] = True
+        errors, payload = validate_config(dict(config), schema, is_core=False)
+        self.assertEqual(errors, [])
+        config.save_config(payload)
+        config = AstrBotConfig(str(path), schema=schema)
+        self.assertFalse(migrate_preview_config(config))
+        self.assertTrue(config["preview"]["preview_enabled"])
+        fields = list(schema)
+        self.assertEqual(
+            fields[fields.index("preview"):fields.index("scan_forwarded_magnets") + 1],
+            ["preview", "auto_download", "scan_forwarded_magnets"],
+        )
+        visible = [key for key, field in schema["preview"]["items"].items() if not field.get("invisible")]
+        self.assertEqual(visible, list(legacy_preview))
         self.assertFalse(config["qb"]["enabled"])
         self.assertEqual(config["qb"]["port"], 8080)
         self.assertEqual(config["aria2"]["port"], 6800)

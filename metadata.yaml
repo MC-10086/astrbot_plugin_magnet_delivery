@@ -1,8 +1,8 @@
 name: astrbot_plugin_magnet_delivery
 display_name: 磁力下载与回传
 desc: 支持 QQ 群聊和私聊的磁力预览、下载、加密压缩与文件回传，可识别合并转发中的磁力链接，并按会话管理任务。
-version: v1.0.3
-author: local
+version: v1.0.4
+author: MC-10086
 support_platforms:
   - aiocqhttp
-astrbot_version: ">=4.29.4,<5"
+astrbot_version: ">=4.29.4"
